@@ -1,0 +1,78 @@
+{
+  "pluginAlias": "HiveThermostat",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Exposes Hive heating zones and hot water to HomeKit via the Hive cloud API.\n\n**First-time setup with 2FA:** enter your username and password and restart. If your account uses SMS two-factor authentication, check the Homebridge log — you'll be prompted to enter the SMS code in the **2FA Code** field below, then restart once more. After that the field can be left blank.",
+  "footerDisplay": "For help and issues see the project's GitHub repository.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Hive Thermostat",
+        "required": true
+      },
+      "username": {
+        "title": "Hive Username (email)",
+        "type": "string",
+        "format": "email",
+        "required": true,
+        "description": "The email address you use to sign in to Hive. Must be the account owner."
+      },
+      "password": {
+        "title": "Hive Password",
+        "type": "string",
+        "required": true
+      },
+      "smsCode": {
+        "title": "2FA Code (first-time setup only)",
+        "type": "string",
+        "required": false,
+        "description": "Only needed during initial pairing if your account has SMS two-factor authentication. Enter the code from the text message, restart, then clear this field."
+      },
+      "pollInterval": {
+        "title": "Poll Interval (seconds)",
+        "type": "integer",
+        "default": 15,
+        "minimum": 15,
+        "maximum": 300,
+        "required": true,
+        "description": "How often to refresh device state from Hive. Minimum 15 seconds to avoid hammering the API. Changes you make from Home are also confirmed by a quick refresh a few seconds after each command."
+      },
+      "hotWaterDurationMinutes": {
+        "title": "Hot Water Boost Duration",
+        "type": "integer",
+        "default": 30,
+        "required": true,
+        "description": "How long hot water runs when its switch is turned on, then it reverts to its schedule."
+      }
+    }
+  },
+  "layout": [
+    "name",
+    "username",
+    {
+      "key": "password",
+      "type": "password"
+    },
+    "smsCode",
+    {
+      "key": "pollInterval",
+      "type": "number",
+      "placeholder": "15"
+    },
+    {
+      "key": "hotWaterDurationMinutes",
+      "type": "select",
+      "titleMap": [
+        { "value": 15, "name": "15 minutes" },
+        { "value": 30, "name": "30 minutes" },
+        { "value": 45, "name": "45 minutes" },
+        { "value": 60, "name": "1 hour" },
+        { "value": 90, "name": "1 hour 30 minutes" },
+        { "value": 120, "name": "2 hours" }
+      ]
+    }
+  ]
+}
