@@ -1,7 +1,7 @@
 {
   "displayName": "Homebridge Hive Thermostat",
   "name": "homebridge-hive-thermostat",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Homebridge plugin exposing Hive heating zones and hot water to HomeKit via the Hive cloud API (Cognito SRP auth with SMS 2FA).",
   "license": "MIT",
   "author": "Kurtis Bell",

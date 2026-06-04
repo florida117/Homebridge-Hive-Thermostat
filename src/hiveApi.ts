@@ -136,10 +136,17 @@ export class HiveApi {
     // When boosting, the "real" underlying mode is stashed in props.previous.
     const previousMode: HiveMode =
       boosting && props.previous?.mode ? props.previous.mode : rawMode;
+    const baseName = state.name ?? 'Hot Water';
+    // Hive often names the hot water product the same as a heating zone (e.g.
+    // "Downstairs"), which collides with that zone's thermostat in HomeKit.
+    // Append "Hot Water" for clarity unless it's already in the name.
+    const name = /hot\s*water/i.test(baseName)
+      ? baseName
+      : `${baseName} Hot Water`;
     return {
       id: p.id,
       type: 'hotwater',
-      name: state.name ?? 'Hot Water',
+      name,
       online,
       mode: previousMode,
       on: props.working === true,

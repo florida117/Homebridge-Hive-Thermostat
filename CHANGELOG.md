@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.1]
+### Fixed
+- Hot water accessories are now named "<zone> Hot Water" to avoid colliding
+  with a heating zone of the same name (Hive often names both identically).
+- Accessory display names now update if the Hive name changes, rather than
+  being fixed at first creation.
+
 ## [0.2.0]
 ### Added
 - Poll-after-write: changes made from HomeKit are confirmed by a one-off

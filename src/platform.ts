@@ -261,6 +261,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       accessory = new this.homebridgeApi.platformAccessory(name, uuid);
       accessory.context.hiveId = id;
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    } else if (accessory.displayName !== name) {
+      // Keep the cached accessory's name in sync if Hive's name changed.
+      accessory.displayName = name;
+      this.homebridgeApi.updatePlatformAccessories([accessory]);
     }
     this.handlers.set(id, new HiveHeatingAccessory(this, accessory, id));
   }
@@ -272,6 +276,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       accessory = new this.homebridgeApi.platformAccessory(name, uuid);
       accessory.context.hiveId = id;
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    } else if (accessory.displayName !== name) {
+      accessory.displayName = name;
+      this.homebridgeApi.updatePlatformAccessories([accessory]);
     }
     this.handlers.set(id, new HiveHotWaterAccessory(this, accessory, id, this.hotWaterBoostMinutes));
   }
