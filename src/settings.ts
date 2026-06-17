@@ -14,6 +14,8 @@ export const HIVE_URLS = {
   sso: 'https://sso.hivehome.com/',
   /** Beekeeper base */
   beekeeperBase: 'https://beekeeper.hivehome.com/1.0',
+  /** Beekeeper write base used by current Hive integrations */
+  beekeeperWriteBase: 'https://beekeeper-uk.hivehome.com/1.0',
   /** All nodes (products + devices + actions) */
   nodesAll: 'https://beekeeper.hivehome.com/1.0/nodes/all?products=true&devices=true&actions=true',
 } as const;

@@ -14,9 +14,9 @@ import {
   CognitoUserSession,
   CognitoRefreshToken,
 } from 'amazon-cognito-identity-js';
-import fetch from 'node-fetch';
 import type { Logger } from 'homebridge';
 import { HIVE_URLS } from './settings';
+import { fetchWithTimeout } from './fetchWithTimeout';
 
 export interface HiveTokens {
   idToken: string;
@@ -66,7 +66,7 @@ export class HiveAuth {
       return this.poolConfig;
     }
 
-    const res = await fetch(HIVE_URLS.sso, {
+    const res = await fetchWithTimeout(HIVE_URLS.sso, {
       headers: {
         // Hive's edge rejects requests without a normal browser UA.
         'User-Agent':

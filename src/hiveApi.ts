@@ -10,9 +10,9 @@
  * refreshed token is always used.
  */
 
-import fetch from 'node-fetch';
 import type { Logger } from 'homebridge';
 import { HIVE_URLS } from './settings';
+import { fetchWithTimeout } from './fetchWithTimeout';
 
 export type HiveMode = 'SCHEDULE' | 'MANUAL' | 'OFF' | 'BOOST';
 
@@ -66,7 +66,9 @@ export class HiveApi {
 
   /** Fetch and normalise all heating + hot water products. */
   async getState(): Promise<HiveState> {
-    const res = await fetch(HIVE_URLS.nodesAll, { headers: this.headers() });
+    const res = await fetchWithTimeout(HIVE_URLS.nodesAll, {
+      headers: this.headers(),
+    });
     if (res.status === 401) {
       throw new TokenExpiredError();
     }
@@ -155,16 +157,9 @@ export class HiveApi {
     };
   }
 
-  /** Discover the per-account write base URL (cached after first call). */
-  private writeBase?: string;
-  private async getWriteBase(): Promise<string> {
-    if (this.writeBase) {
-      return this.writeBase;
-    }
-    // beekeeper /1.0/auth/admin-login style discovery isn't needed for writes;
-    // the documented base is the beekeeper base itself.
-    this.writeBase = HIVE_URLS.beekeeperBase;
-    return this.writeBase;
+  /** Return preferred write hosts, keeping the older host as a 404 fallback. */
+  private getWriteBases(): string[] {
+    return [...new Set([HIVE_URLS.beekeeperWriteBase, HIVE_URLS.beekeeperBase])];
   }
 
   /** POST a state change to a node. */
@@ -173,21 +168,38 @@ export class HiveApi {
     id: string,
     payload: Record<string, string | number>,
   ): Promise<void> {
-    const base = await this.getWriteBase();
-    const url = `${base}/nodes/${type}/${id}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify(payload),
-    });
-    if (res.status === 401) {
-      throw new TokenExpiredError();
-    }
-    if (!res.ok) {
+    let lastError: Error | undefined;
+
+    for (const base of this.getWriteBases()) {
+      const url = `${base}/nodes/${type}/${id}`;
+      const res = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 401) {
+        throw new TokenExpiredError();
+      }
+      if (res.ok) {
+        this.log.debug(`Hive ${type}/${id} <= ${JSON.stringify(payload)} via ${base}`);
+        return;
+      }
+
       const text = await res.text().catch(() => '');
-      throw new Error(`Hive setState ${type}/${id} failed: HTTP ${res.status} ${text}`);
+      const detail = text ? ` ${this.sanitiseErrorBody(text)}` : '';
+      lastError = new Error(
+        `Hive setState ${type}/${id} failed via ${base}: HTTP ${res.status}${detail}`,
+      );
+      if (res.status !== 404) {
+        break;
+      }
     }
-    this.log.debug(`Hive ${type}/${id} <= ${JSON.stringify(payload)}`);
+
+    throw lastError ?? new Error(`Hive setState ${type}/${id} failed.`);
+  }
+
+  private sanitiseErrorBody(text: string): string {
+    return text.replace(/\s+/g, ' ').slice(0, 300);
   }
 
   setHeatingTarget(id: string, temp: number): Promise<void> {

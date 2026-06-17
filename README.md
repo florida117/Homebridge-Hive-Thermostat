@@ -15,17 +15,32 @@ Hive's own HomeKit bridge has long-standing stability problems — accessories c
 - Auto-discovers all heating zones and hot water controls on your account
 - Each heating zone exposed as a HomeKit **Thermostat** (current temp, target temp, off / heat / schedule)
 - Hot water exposed as a **Switch** with a timed boost (like homebridge-nest): flip it on to run hot water for a configurable number of minutes, flip it off to cancel
+- Optional Homebridge v2 **Matter** support: heating zones are also exposed as Matter Thermostats and hot water boosts as Matter On/Off Outlets
 - Reports **No Response** in the Home app when Hive marks a device offline, rather than showing stale data
 - One-time SMS 2FA during setup, then silent token refresh — no repeated SMS prompts
 - Configurable poll interval
 
 ## Mode mapping
 
+### HomeKit
+
 | Hive mode | HomeKit state |
 |-----------|---------------|
 | Off       | Off           |
 | Manual    | Heat          |
 | Schedule  | Auto          |
+
+### Matter
+
+| Hive mode | Matter thermostat system mode |
+|-----------|--------------------------------|
+| Off       | Off                            |
+| Manual    | Heat                           |
+| Schedule  | Auto                           |
+
+Matter thermostat temperatures are exposed in Celsius. Hot water is exposed as
+an On/Off Outlet whose on state represents a manual boost, matching the HomeKit
+switch behavior.
 
 ## Installation
 
@@ -48,7 +63,8 @@ Use the Homebridge UI settings form, or add a platform block to `config.json`:
       "username": "you@example.com",
       "password": "your-hive-password",
       "pollInterval": 30,
-      "hotWaterDurationMinutes": 30
+      "hotWaterDurationMinutes": 30,
+      "enableMatter": true
     }
   ]
 }
@@ -66,6 +82,27 @@ Use the Homebridge UI settings form, or add a platform block to `config.json`:
 If the refresh token is ever rejected (Hive occasionally invalidates them
 server-side), you'll see a re-authentication message in the log and need to
 repeat the SMS step once.
+
+### Matter support
+
+Matter support requires Homebridge v2 with Matter enabled for the main bridge or
+the plugin's child bridge. The plugin will continue to expose normal HomeKit
+accessories, and when both Homebridge Matter and `enableMatter` are enabled it
+will additionally register Matter accessories.
+
+To use it:
+
+1. Run Homebridge v2 on a supported Node.js version.
+2. Enable Matter in the relevant Homebridge bridge settings.
+3. Keep **Enable Matter Accessories** (`enableMatter`) turned on in this plugin.
+4. Restart Homebridge so the Matter bridge can register the Hive accessories.
+
+Matter support is intentionally limited to the device types that map cleanly to
+Hive:
+
+- Heating zones become Matter Thermostats.
+- Hot water becomes a Matter On/Off Outlet for manual boost control.
+- Hive schedules are not edited through Matter; Schedule maps to Matter Auto.
 
 ## Credits
 

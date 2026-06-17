@@ -20,6 +20,7 @@ import {
   PlatformAccessory,
   PlatformConfig,
   Service,
+  MatterAccessory,
 } from 'homebridge';
 import { promises as fs } from 'fs';
 import path from 'path';
@@ -34,6 +35,7 @@ import { HiveAuth, HiveSmsRequired, HiveTokens } from './hiveAuth';
 import { HiveApi, HiveState, TokenExpiredError } from './hiveApi';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
+import { HiveMatterPlatform } from './matterPlatform';
 
 interface HiveConfig extends PlatformConfig {
   username?: string;
@@ -41,6 +43,7 @@ interface HiveConfig extends PlatformConfig {
   smsCode?: string;
   pollInterval?: number;
   hotWaterDurationMinutes?: number;
+  enableMatter?: boolean;
 }
 
 export class HiveThermostatPlatform implements DynamicPlatformPlugin {
@@ -58,6 +61,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private pollTimer?: NodeJS.Timeout;
   private readonly pollIntervalMs: number;
   private readonly hotWaterBoostMinutes: number;
+  private readonly matterPlatform?: HiveMatterPlatform;
 
   /** Handlers keyed by hive product id, so polling can push updates. */
   private readonly handlers = new Map<
@@ -80,6 +84,25 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     );
 
     this.hotWaterBoostMinutes = this.cfg.hotWaterDurationMinutes ?? 30;
+    if (this.cfg.enableMatter !== false) {
+      this.matterPlatform = new HiveMatterPlatform(
+        this.homebridgeApi,
+        this.log,
+        {
+          setHeatingMode: (id, mode) => this.hive.setHeatingMode(id, mode),
+          setHeatingTarget: (id, temp) => this.hive.setHeatingTarget(id, temp),
+          setHotWaterBoost: (id, minutes) => this.hive.setHotWaterBoost(id, minutes),
+          cancelHotWaterBoost: (id, previousMode) =>
+            this.hive.cancelHotWaterBoost(id, previousMode),
+          pollSoon: () => this.pollSoon(),
+        },
+        this.hotWaterBoostMinutes,
+        path.join(
+          this.homebridgeApi.user.storagePath(),
+          '.hive-thermostat-matter.json',
+        ),
+      );
+    }
 
     this.tokenStorePath = path.join(
       this.homebridgeApi.user.storagePath(),
@@ -112,6 +135,12 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   /** Restore cached accessories so HomeKit keeps their identity across restarts. */
   configureAccessory(accessory: PlatformAccessory): void {
     this.accessories.push(accessory);
+  }
+
+  configureMatterAccessory(accessory: MatterAccessory): void {
+    this.matterPlatform?.configureAccessory(accessory as Parameters<
+      HiveMatterPlatform['configureAccessory']
+    >[0]);
   }
 
   // ---- Auth bootstrap ------------------------------------------------------
@@ -199,6 +228,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         JSON.stringify({ refreshToken }),
         { mode: 0o600 },
       );
+      await fs.chmod(this.tokenStorePath, 0o600);
     } catch (err) {
       this.log.warn(`Hive: could not persist refresh token: ${(err as Error).message}`);
     }
@@ -252,6 +282,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
     // Seed initial values.
     this.applyState(state);
+    await this.matterPlatform?.register(state);
   }
 
   private registerHeating(id: string, name: string): void {
@@ -325,12 +356,18 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       if (h instanceof HiveHeatingAccessory) {
         h.update(zone);
       }
+      this.matterPlatform?.updateHeating(zone).catch((err) =>
+        this.log.debug(`Hive Matter heating update failed: ${(err as Error).message}`),
+      );
     }
     for (const hw of state.hotWater) {
       const h = this.handlers.get(hw.id);
       if (h instanceof HiveHotWaterAccessory) {
         h.update(hw);
       }
+      this.matterPlatform?.updateHotWater(hw).catch((err) =>
+        this.log.debug(`Hive Matter hot water update failed: ${(err as Error).message}`),
+      );
     }
   }
 

@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0]
+### Added
+- Homebridge v2 Matter support. Heating zones are exposed as Matter Thermostats
+  and hot water boost controls as Matter On/Off Outlets when Matter is enabled
+  for the bridge.
+- `enableMatter` config option to allow users to opt out of Matter accessory
+  registration while keeping Homebridge Matter enabled for the bridge.
+
+### Fixed
+- Matter thermostat registration supplies the occupancy metadata required by
+  Homebridge's Matter thermostat validation.
+- Matter thermostats no longer publish unsupported Matter auto-mode or preset
+  attributes during commissioning.
+- Matter serial numbers are normalised to fit Matter length constraints when
+  Hive product IDs are UUID-shaped.
+- Hive writes now use the current UK Beekeeper host, with the legacy host kept
+  as a fallback for 404 responses.
+
+### Changed
+- Development dependency and engine metadata now target Homebridge v2 and
+  supported Node.js versions for Matter.
+
 ## [0.2.1]
 ### Fixed
 - Hot water accessories are now named "<zone> Hot Water" to avoid colliding

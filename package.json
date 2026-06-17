@@ -1,7 +1,7 @@
 {
   "displayName": "Homebridge Hive Thermostat",
   "name": "homebridge-hive-thermostat",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Homebridge plugin exposing Hive heating zones and hot water to HomeKit via the Hive cloud API (Cognito SRP auth with SMS 2FA).",
   "license": "MIT",
   "author": "Kurtis Bell",
@@ -14,14 +14,22 @@
   },
   "homepage": "https://github.com/florida117/Homebridge-Hive-Thermostat#readme",
   "main": "dist/index.js",
+  "files": [
+    "dist",
+    "config.schema.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "engines": {
-    "homebridge": ">=1.6.0 || ^2.0.0-beta.0",
-    "node": ">=18.0.0"
+    "homebridge": ">=2.0.0",
+    "node": "^22 || ^24"
   },
   "scripts": {
     "build": "rimraf dist && tsc",
     "watch": "npm run build && nodemon",
     "lint": "eslint src/**.ts",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -36,10 +44,13 @@
     "amazon-cognito-identity-js": "^6.3.12",
     "node-fetch": "^2.7.0"
   },
+  "overrides": {
+    "js-cookie": "3.0.8"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/node-fetch": "^2.6.11",
-    "homebridge": "^1.8.0",
+    "homebridge": "^2.1.0",
     "rimraf": "^5.0.0",
     "typescript": "^5.4.0"
   }

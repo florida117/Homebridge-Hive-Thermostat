@@ -46,6 +46,91 @@
         "default": 30,
         "required": true,
         "description": "How long hot water runs when its switch is turned on, then it reverts to its schedule."
+      },
+      "enableMatter": {
+        "title": "Enable Matter Accessories",
+        "type": "boolean",
+        "default": true,
+        "required": true,
+        "description": "When Homebridge v2 Matter is enabled for this bridge, also expose Hive heating and hot water as Matter accessories."
+      },
+      "_bridge": {
+        "title": "Child Bridge",
+        "type": "object",
+        "required": false,
+        "description": "Homebridge child bridge settings. Use bind to restrict HomeKit and Matter mDNS to a specific interface or IP address.",
+        "properties": {
+          "username": {
+            "title": "Bridge Username",
+            "type": "string"
+          },
+          "port": {
+            "title": "Bridge Port",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Bridge Name",
+            "type": "string"
+          },
+          "manufacturer": {
+            "title": "Manufacturer",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "firmwareRevision": {
+            "title": "Firmware Revision",
+            "type": "string"
+          },
+          "bind": {
+            "title": "Network Interface",
+            "description": "Bind this child bridge, including Matter mDNS, to a specific interface name or IP address such as eth0, wlan0, or 192.168.1.10.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "hap": {
+            "title": "HomeKit",
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "title": "Enable HomeKit",
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
+          },
+          "matter": {
+            "title": "Matter",
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "title": "Enable Matter",
+                "type": "boolean"
+              },
+              "port": {
+                "title": "Matter Port",
+                "type": "integer"
+              },
+              "externalsOnly": {
+                "title": "Expose External Accessories Only",
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
       }
     }
   },
@@ -56,7 +141,10 @@
       "key": "password",
       "type": "password"
     },
-    "smsCode",
+    {
+      "key": "smsCode",
+      "type": "password"
+    },
     {
       "key": "pollInterval",
       "type": "number",
@@ -73,6 +161,7 @@
         { "value": 90, "name": "1 hour 30 minutes" },
         { "value": 120, "name": "2 hours" }
       ]
-    }
+    },
+    "enableMatter"
   ]
 }
