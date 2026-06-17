@@ -79,10 +79,14 @@ Matter instance. This was fixed earlier on the branch (commit `e2eca4b`).
 
 ### Hive → Matter mapping
 
-- Heating zone → Matter **Thermostat**, presented as **heating-only**
-  (`ControlSequenceOfOperation.HeatingOnly`). Home shows Off/Heat; Cool is
-  rejected, matching the real device. Hive `OFF` ↔ Matter `Off`; any other Hive
-  mode ↔ Matter `Heat`.
+- Heating zone → Matter **Thermostat**, presented as **heating-only**. The Home
+  app derives its mode buttons from the thermostat cluster's **FeatureMap**, not
+  from `ControlSequenceOfOperation`, so to show only Off/Heat (not Cool/Auto)
+  the device type's supported features are restricted to Heating + Occupancy
+  (see `heatingDeviceType()` in `matterPlatform.ts`). This also disables the
+  Cooling, AutoMode and Presets features. Hive `OFF` ↔ Matter `Off`; any other
+  Hive mode ↔ Matter `Heat`. `thermostatRunningMode` is not published because it
+  requires the (now-disabled) AutoMode feature.
 - Hot water → Matter **OnOffOutlet** used as a boost switch. On = start boost
   for the configured minutes; Off = return to the previous mode.
 - Temperatures are Celsius × 100 (Matter's centidegree unit).
@@ -171,15 +175,20 @@ Pi). Worse, `registerPlatformAccessories` only *emits* an event — the endpoint
 initialization (and its validation failure) happens asynchronously afterwards,
 so the failure cannot be caught with a `try/catch` around registration.
 
-The fix therefore uses a sensible default plus a **self-healing retry**:
+As of the heating-only change the Presets state is largely **deterministic**:
+restricting the device type's features to Heating + Occupancy (see
+`heatingDeviceType()`) makes Homebridge rebuild its `HomebridgeThermostatServer`
+with `presets: false`, so `presetTypes` must be absent. The fix nonetheless
+keeps a **self-healing retry** as a fallback for older Homebridge builds that
+ignore the supplied feature set:
 
-1. **Default the first guess to enabled** (`DEFAULT_PRESETS_ENABLED = true`).
-   We deliberately do *not* read the device-type template's feature flags:
-   they proved misleading (the Pi reports `presets: false` there yet the live
-   endpoint requires `presetTypes`, because Homebridge wraps the thermostat in
-   its own `HomebridgeThermostatServer`). Current Homebridge 2.x runtimes
-   require presets, so defaulting to enabled makes the common case — including
-   the Pi — succeed on the very first attempt.
+1. **Default the first guess to disabled** (`DEFAULT_PRESETS_ENABLED = false`),
+   matching the heating-only feature set. We deliberately do *not* read the
+   device-type template's feature flags — they proved misleading. On a build
+   that honours the restricted features (current Homebridge 2.x), the common
+   case succeeds on the first attempt with no `presetTypes`. A build that
+   ignores the restriction and keeps its default preset-enabled thermostat
+   server self-heals via the retry below.
 2. **Self-healing registration** (`register()` → `registerWith()` +
    `verifyThermostats()`): register with the guess, then poll
    `getAccessoryState(uuid, 'thermostat')` for each zone. A thermostat whose

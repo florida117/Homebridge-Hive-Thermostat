@@ -25,18 +25,25 @@ const CELSIUS_TO_MATTER = 100;
 
 /**
  * Default assumption for the Matter Presets feature on a first run (no
- * remembered value). Current Homebridge 2.x runtime thermostats require a
- * non-empty `presetTypes` array, and the device-type template cannot be trusted
- * to reveal this (see register()). Defaulting to enabled makes the common case
- * succeed on the first attempt; the self-healing retry covers the exceptions.
+ * remembered value).
+ *
+ * We now hand Homebridge a heating-only Thermostat device type (see
+ * heatingDeviceType()) whose feature set is Heating + Occupancy — which
+ * disables Presets. On any Homebridge build that honours those features the
+ * thermostat must NOT carry a `presetTypes` array, so the correct first guess
+ * is "disabled". The self-healing retry in register() still covers older
+ * builds that ignore the supplied feature set and fall back to their default
+ * preset-enabled thermostat server.
  */
-const DEFAULT_PRESETS_ENABLED = true;
+const DEFAULT_PRESETS_ENABLED = false;
 
 export class HiveMatterPlatform {
   private readonly cached = new Map<string, MatterAccessory<HiveMatterContext>>();
   private registered = false;
   /** Whether the current/last registration attempt includes preset attributes. */
   private activePresets = false;
+  /** Lazily-built heating-only Thermostat device type (see heatingDeviceType). */
+  private heatingType?: unknown;
 
   constructor(
     private readonly api: MatterApiHost,
@@ -235,7 +242,8 @@ export class HiveMatterPlatform {
     // limits and controlSequenceOfOperation are fixed for the life of the
     // accessory; re-writing them every poll is pointless work (they are not
     // writable and would be silently reverted by the Matter thermostat server).
-    const { Thermostat } = matter.types;
+    // thermostatRunningMode is omitted for the same reason as in
+    // heatingCluster(): it requires the AutoMode feature, which is disabled.
     await matter.updateAccessoryState(
       this.heatingUuid(zone.id),
       matter.clusterNames.Thermostat,
@@ -243,9 +251,6 @@ export class HiveMatterPlatform {
         localTemperature: this.toMatterTemperature(zone.currentTemperature),
         occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
         systemMode: this.matterModeFromHive(zone.mode),
-        thermostatRunningMode: zone.heating
-          ? Thermostat.ThermostatRunningMode.Heat
-          : Thermostat.ThermostatRunningMode.Off,
       },
     );
   }
@@ -269,9 +274,11 @@ export class HiveMatterPlatform {
     return {
       UUID: this.heatingUuid(zone.id),
       displayName: zone.name,
-      // Use Homebridge's bridge-provided type so Matter behavior classes come
-      // from the running Homebridge instance, not this plugin's dependency tree.
-      deviceType: matter.deviceTypes.Thermostat,
+      // A heating-only variant of Homebridge's bridge-provided Thermostat type,
+      // so the Home app shows only Off/Heat (not Cool/Auto). See
+      // heatingDeviceType() for why this is built from the bridge type rather
+      // than imported, and how it also disables the Presets feature.
+      deviceType: this.heatingDeviceType(matter) as MatterAccessory<HiveMatterContext>['deviceType'],
       manufacturer: 'Hive',
       model: 'Heating Zone',
       serialNumber: this.serialNumber(zone.id),
@@ -338,6 +345,43 @@ export class HiveMatterPlatform {
     };
   }
 
+  /**
+   * Build (once) a heating-only Thermostat device type.
+   *
+   * Homebridge's bridge-provided `deviceTypes.Thermostat` advertises the
+   * Heating, Cooling, Occupancy AND AutoMode features, so the Home app shows
+   * Off/Cool/Heat/Auto. The Hive only heats, so we restrict the supported
+   * features to Heating + Occupancy. Homebridge's AccessoryManager reads the
+   * feature set from the device type we supply (it inspects the thermostat
+   * behaviour's `cluster.supportedFeatures`) and rebuilds its
+   * `HomebridgeThermostatServer` with exactly those features — so the endpoint
+   * ends up Off/Heat only. Restricting features this way also disables the
+   * Presets feature (see DEFAULT_PRESETS_ENABLED / heatingCluster()).
+   *
+   * Two details matter:
+   *  - It is built from `matter.deviceTypes.Thermostat` (and that type's own
+   *    thermostat behaviour class) rather than importing matter.js directly, so
+   *    the behaviour classes come from the running Homebridge instance and the
+   *    classes match (avoids "identify is not a Behavior.Type").
+   *  - The behaviour is bound to the restricted cluster with `.for(...)`, not
+   *    the endpoint's `.with(...)`. In matter.js 0.17 only the `.for(cluster)`
+   *    form exposes `cluster.supportedFeatures`, which is the property
+   *    Homebridge reads to detect the feature set.
+   */
+  private heatingDeviceType(matter: MatterAPI): unknown {
+    if (!this.heatingType) {
+      const base = matter.deviceTypes.Thermostat as {
+        behaviors: { thermostat: { for(cluster: unknown): unknown } };
+        with(behavior: unknown): unknown;
+      };
+      const cluster = (matter.clusters.Thermostat as {
+        with(...features: string[]): unknown;
+      }).with('Heating', 'Occupancy');
+      this.heatingType = base.with(base.behaviors.thermostat.for(cluster));
+    }
+    return this.heatingType;
+  }
+
   private heatingCluster(zone: HiveHeatingZone) {
     const { Thermostat } = this.api.matter!.types;
     const base = {
@@ -354,9 +398,11 @@ export class HiveMatterPlatform {
       // rejected).
       controlSequenceOfOperation: Thermostat.ControlSequenceOfOperation.HeatingOnly,
       systemMode: this.matterModeFromHive(zone.mode),
-      thermostatRunningMode: zone.heating
-        ? Thermostat.ThermostatRunningMode.Heat
-        : Thermostat.ThermostatRunningMode.Off,
+      // NB: thermostatRunningMode is intentionally NOT set. Its Matter
+      // conformance is "[AUTO]" — it only exists when the AutoMode feature is
+      // supported, and the heating-only device type (see heatingDeviceType())
+      // disables AutoMode. Setting it fails validation with Conformance
+      // "[AUTO]". systemMode + localTemperature already convey heat/off to Home.
     };
 
     // The Matter Presets feature is enabled on some Homebridge / matter.js

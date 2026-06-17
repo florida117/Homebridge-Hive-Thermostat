@@ -11,6 +11,10 @@ All notable changes to this project are documented here.
   registration while keeping Homebridge Matter enabled for the bridge.
 
 ### Fixed
+- Matter heating zones now expose a heating-only thermostat, so the Home app
+  shows only Off/Heat instead of Off/Cool/Heat/Auto. Restricting the device
+  type's features to Heating + Occupancy also disables the Presets feature
+  deterministically.
 - Matter thermostat registration supplies the occupancy metadata required by
   Homebridge's Matter thermostat validation.
 - Matter thermostats no longer publish unsupported Matter auto-mode or preset
