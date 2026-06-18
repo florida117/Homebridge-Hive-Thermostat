@@ -79,14 +79,18 @@ Matter instance. This was fixed earlier on the branch (commit `e2eca4b`).
 
 ### Hive → Matter mapping
 
-- Heating zone → Matter **Thermostat**, presented as **heating-only**. The Home
-  app derives its mode buttons from the thermostat cluster's **FeatureMap**, not
-  from `ControlSequenceOfOperation`, so to show only Off/Heat (not Cool/Auto)
-  the device type's supported features are restricted to Heating + Occupancy
-  (see `heatingDeviceType()` in `matterPlatform.ts`). This also disables the
-  Cooling, AutoMode and Presets features. Hive `OFF` ↔ Matter `Off`; any other
-  Hive mode ↔ Matter `Heat`. `thermostatRunningMode` is not published because it
-  requires the (now-disabled) AutoMode feature.
+- Heating zone → Matter **Thermostat**, using Homebridge's bridge-provided
+  Thermostat device type (Heating + Cooling + AutoMode + Occupancy). The Home app
+  derives its mode buttons from the thermostat cluster's **FeatureMap**, so it
+  shows Off/Cool/Heat/Auto. Hive cannot cool, so `controlSequenceOfOperation` is
+  `HeatingOnly`: the Cool button still appears but matter.js *rejects* a Cool
+  selection (`SystemMode Cool is not allowed with ControlSequenceOfOperation
+  HeatingOnly`), making it inert. Mode mapping: Hive `OFF` ↔ Matter `Off`; Hive
+  `SCHEDULE` ↔ Matter `Auto` (Matter has no schedule mode, so Auto drives the
+  Hive schedule); any other Hive mode (`MANUAL`/`BOOST`) ↔ Matter `Heat`.
+  This matches the HAP thermostat, which likewise maps Auto → schedule.
+  `thermostatRunningMode` is published (valid because the AutoMode feature is
+  present) to convey heat/off running state.
 - Hot water → Matter **OnOffOutlet** used as a boost switch. On = start boost
   for the configured minutes; Off = return to the previous mode.
 - Temperatures are Celsius × 100 (Matter's centidegree unit).
@@ -175,20 +179,17 @@ Pi). Worse, `registerPlatformAccessories` only *emits* an event — the endpoint
 initialization (and its validation failure) happens asynchronously afterwards,
 so the failure cannot be caught with a `try/catch` around registration.
 
-As of the heating-only change the Presets state is largely **deterministic**:
-restricting the device type's features to Heating + Occupancy (see
-`heatingDeviceType()`) makes Homebridge rebuild its `HomebridgeThermostatServer`
-with `presets: false`, so `presetTypes` must be absent. The fix nonetheless
-keeps a **self-healing retry** as a fallback for older Homebridge builds that
-ignore the supplied feature set:
+The plugin uses Homebridge's full-feature Thermostat device type (so the Home
+app can show Auto, which maps to the Hive schedule), and the Presets state is
+**not deterministic** across builds — some require a non-empty `presetTypes`
+array, others reject it entirely. The fix is a **self-healing retry**:
 
-1. **Default the first guess to disabled** (`DEFAULT_PRESETS_ENABLED = false`),
-   matching the heating-only feature set. We deliberately do *not* read the
-   device-type template's feature flags — they proved misleading. On a build
-   that honours the restricted features (current Homebridge 2.x), the common
-   case succeeds on the first attempt with no `presetTypes`. A build that
-   ignores the restriction and keeps its default preset-enabled thermostat
-   server self-heals via the retry below.
+1. **Default the first guess to enabled** (`DEFAULT_PRESETS_ENABLED = true`),
+   matching current Homebridge 2.x runtime thermostats, which require a
+   non-empty `presetTypes`. We deliberately do *not* read the device-type
+   template's feature flags — they proved misleading (a template can report
+   `presets: false` yet the live endpoint still requires `presetTypes`). A build
+   that instead rejects `presetTypes` self-heals via the retry below.
 2. **Self-healing registration** (`register()` → `registerWith()` +
    `verifyThermostats()`): register with the guess, then poll
    `getAccessoryState(uuid, 'thermostat')` for each zone. A thermostat whose

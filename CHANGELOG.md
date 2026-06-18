@@ -9,16 +9,18 @@ All notable changes to this project are documented here.
   for the bridge.
 - `enableMatter` config option to allow users to opt out of Matter accessory
   registration while keeping Homebridge Matter enabled for the bridge.
+- Selecting Auto on a heating zone now switches it to the Hive schedule, on both
+  the HomeKit (HAP) thermostat and the Matter thermostat. On Matter the Cool
+  button is still shown (the bridge thermostat type advertises Cooling) but is
+  inert — the heating-only control sequence makes Matter reject a Cool selection.
 
 ### Fixed
-- Matter heating zones now expose a heating-only thermostat, so the Home app
-  shows only Off/Heat instead of Off/Cool/Heat/Auto. Restricting the device
-  type's features to Heating + Occupancy also disables the Presets feature
-  deterministically.
 - Matter thermostat registration supplies the occupancy metadata required by
   Homebridge's Matter thermostat validation.
-- Matter thermostats no longer publish unsupported Matter auto-mode or preset
-  attributes during commissioning.
+- Matter thermostats self-heal the Presets feature: the required state differs
+  between Homebridge/matter.js builds, so registration verifies each thermostat
+  came online and retries with the opposite Presets setting if needed, then
+  remembers the working choice across restarts.
 - Matter serial numbers are normalised to fit Matter length constraints when
   Hive product IDs are UUID-shaped.
 - Hive writes now use the current UK Beekeeper host, with the legacy host kept

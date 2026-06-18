@@ -7,6 +7,11 @@
  *   SCHEDULE             -> AUTO
  *   (BOOST is surfaced as HEAT; underlying mode tracked by the API layer)
  *
+ * Cool is never exposed (Hive cannot cool). Auto is kept so the Hive schedule
+ * stays selectable from HomeKit. Note: Apple Home honours validValues and hides
+ * Cool, but the Homebridge accessories UI renders a generic thermostat control
+ * that always shows all four buttons regardless of validValues.
+ *
  * When offline, characteristics are reported with a NO_RESPONSE error so the
  * Home app shows "No Response" rather than stale values.
  */
