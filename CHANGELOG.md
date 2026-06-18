@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.1] - 2026-06-18
+### Fixed
+- `config.schema.json`: moved `required` from individual property fields to a
+  top-level array on the schema object, fixing JSON Schema validation failure
+  flagged by the Homebridge Verified check.
+
 ## [1.0.0] - 2026-06-18
 First public release on npm. (Versions below are pre-release development
 history.)

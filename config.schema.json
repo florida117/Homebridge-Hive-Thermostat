@@ -6,29 +6,26 @@
   "footerDisplay": "For help and issues see the project's GitHub repository.",
   "schema": {
     "type": "object",
+    "required": ["name", "username", "password", "pollInterval", "hotWaterDurationMinutes", "enableMatter"],
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Hive Thermostat",
-        "required": true
+        "default": "Hive Thermostat"
       },
       "username": {
         "title": "Hive Username (email)",
         "type": "string",
         "format": "email",
-        "required": true,
         "description": "The email address you use to sign in to Hive. Must be the account owner."
       },
       "password": {
         "title": "Hive Password",
-        "type": "string",
-        "required": true
+        "type": "string"
       },
       "smsCode": {
         "title": "2FA Code (first-time setup only)",
         "type": "string",
-        "required": false,
         "description": "Only needed during initial pairing if your account has SMS two-factor authentication. Enter the code from the text message, restart, then clear this field."
       },
       "pollInterval": {
@@ -37,27 +34,23 @@
         "default": 15,
         "minimum": 15,
         "maximum": 300,
-        "required": true,
         "description": "How often to refresh device state from Hive. Minimum 15 seconds to avoid hammering the API. Changes you make from Home are also confirmed by a quick refresh a few seconds after each command."
       },
       "hotWaterDurationMinutes": {
         "title": "Hot Water Boost Duration",
         "type": "integer",
         "default": 30,
-        "required": true,
         "description": "How long hot water runs when its switch is turned on, then it reverts to its schedule."
       },
       "enableMatter": {
         "title": "Enable Matter Accessories",
         "type": "boolean",
         "default": true,
-        "required": true,
         "description": "When Homebridge v2 Matter is enabled for this bridge, also expose Hive heating and hot water as Matter accessories."
       },
       "_bridge": {
         "title": "Child Bridge",
         "type": "object",
-        "required": false,
         "description": "Homebridge child bridge settings. Use bind to restrict HomeKit and Matter mDNS to a specific interface or IP address.",
         "properties": {
           "username": {
