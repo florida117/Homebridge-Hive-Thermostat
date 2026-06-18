@@ -10,6 +10,22 @@ Hive's own HomeKit bridge has long-standing stability problems — accessories c
 
 > **Note:** because it uses the Hive cloud API, this plugin requires an internet connection to function. It does not talk to the Hive hub locally.
 
+## HomeKit (HAP) or Matter?
+
+You can use either, or both at once:
+
+- **HomeKit / HAP** works on any Homebridge install with no extra setup — your
+  Hive devices appear in the Home app through the Homebridge bridge. This is the
+  default and the right choice for most people.
+- **Matter** is optional and needs Homebridge v2 with Matter enabled (see
+  [Matter support](#matter-support)). It additionally publishes the same Hive
+  devices over Matter, which is useful if you want to add them to a
+  Matter/Thread ecosystem or controller. Turn it off with `enableMatter: false`
+  if you only want HAP.
+
+Both expose the same devices with the same behavior, so pick whichever your
+setup prefers.
+
 ## Features
 
 - Auto-discovers all heating zones and hot water controls on your account
@@ -32,11 +48,16 @@ Hive's own HomeKit bridge has long-standing stability problems — accessories c
 
 ### Matter
 
-| Hive mode | Matter thermostat system mode |
-|-----------|--------------------------------|
-| Off       | Off                            |
-| Manual    | Heat                           |
-| Schedule  | Auto                           |
+| Hive mode      | Matter thermostat system mode |
+|----------------|--------------------------------|
+| Off            | Off                            |
+| Manual / Boost | Heat                           |
+| Schedule       | Auto                           |
+
+> The Matter thermostat also shows a **Cool** button. Matter only offers an
+> **Auto** mode when the Cooling feature is present, so Cooling is advertised to
+> keep Auto (and therefore the Hive schedule) available — but Hive cannot cool,
+> so selecting Cool is rejected and has no effect.
 
 Matter thermostat temperatures are exposed in Celsius. Hot water is exposed as
 an On/Off Outlet whose on state represents a manual boost, matching the HomeKit

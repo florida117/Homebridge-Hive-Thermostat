@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [0.3.0]
+## [0.3.0] - 2026-06-18
 ### Added
 - Homebridge v2 Matter support. Heating zones are exposed as Matter Thermostats
   and hot water boost controls as Matter On/Off Outlets when Matter is enabled
