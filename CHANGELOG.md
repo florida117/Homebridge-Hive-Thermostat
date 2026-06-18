@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.2] - 2026-06-18
+### Changed
+- npm publishing is now automated via GitHub Actions on version tag push.
+
 ## [1.0.1] - 2026-06-18
 ### Fixed
 - `config.schema.json`: moved `required` from individual property fields to a
