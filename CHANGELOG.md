@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.3] - 2026-06-18
+### Fixed
+- Pin `form-data` to `^4.0.6` via overrides to resolve a high-severity CRLF
+  injection vulnerability in a transitive dev dependency (`@types/node-fetch`).
+
 ## [1.0.2] - 2026-06-18
 ### Changed
 - npm publishing is now automated via GitHub Actions on version tag push.
