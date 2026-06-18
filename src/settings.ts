@@ -12,9 +12,9 @@ export const PLATFORM_NAME = 'HiveThermostat';
 export const HIVE_URLS = {
   /** Page whose first <script> tag holds the Cognito pool + client IDs */
   sso: 'https://sso.hivehome.com/',
-  /** Beekeeper base */
+  /** Beekeeper base — handles both reads and writes for most accounts. */
   beekeeperBase: 'https://beekeeper.hivehome.com/1.0',
-  /** Beekeeper write base used by current Hive integrations */
+  /** Regional write host, kept only as a fallback for accounts that need it. */
   beekeeperWriteBase: 'https://beekeeper-uk.hivehome.com/1.0',
   /** All nodes (products + devices + actions) */
   nodesAll: 'https://beekeeper.hivehome.com/1.0/nodes/all?products=true&devices=true&actions=true',

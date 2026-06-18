@@ -23,8 +23,10 @@ All notable changes to this project are documented here.
   remembers the working choice across restarts.
 - Matter serial numbers are normalised to fit Matter length constraints when
   Hive product IDs are UUID-shaped.
-- Hive writes now use the current UK Beekeeper host, with the legacy host kept
-  as a fallback for 404 responses.
+- Hive writes (mode/target/boost) target the main Beekeeper host that also
+  serves reads, with the regional `-uk` host kept as a fallback. Fixes mode
+  changes failing with HTTP 403 Forbidden, and the host fallback now triggers on
+  403 as well as 404.
 
 ### Changed
 - Development dependency and engine metadata now target Homebridge v2 and

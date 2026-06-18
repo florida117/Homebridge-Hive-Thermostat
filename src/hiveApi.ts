@@ -157,9 +157,15 @@ export class HiveApi {
     };
   }
 
-  /** Return preferred write hosts, keeping the older host as a 404 fallback. */
+  /**
+   * Write hosts in preference order. The main beekeeper host (which also serves
+   * reads) is tried first; the regional `-uk` host is a fallback for accounts
+   * that need it. We fall through to the next host on a gateway-level rejection
+   * (403/404) — the AWS API Gateway in front of Hive returns those when the host
+   * doesn't route the request, so the alternate host is worth a try.
+   */
   private getWriteBases(): string[] {
-    return [...new Set([HIVE_URLS.beekeeperWriteBase, HIVE_URLS.beekeeperBase])];
+    return [...new Set([HIVE_URLS.beekeeperBase, HIVE_URLS.beekeeperWriteBase])];
   }
 
   /** POST a state change to a node. */
@@ -190,7 +196,10 @@ export class HiveApi {
       lastError = new Error(
         `Hive setState ${type}/${id} failed via ${base}: HTTP ${res.status}${detail}`,
       );
-      if (res.status !== 404) {
+      // 403/404 are gateway-level "this host won't route that" responses; try
+      // the next host. Any other status means the host handled the request and
+      // genuinely rejected it, so stop and report.
+      if (res.status !== 403 && res.status !== 404) {
         break;
       }
     }
