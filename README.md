@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/florida117/Homebridge-Hive-Thermostat/main/branding/hive_logo.png" width="120" alt="Hive logo">
+</p>
+
 # homebridge-hive-thermostat
 
 A Homebridge plugin that exposes **Hive heating zones and hot water** to Apple HomeKit, talking directly to the Hive cloud API.

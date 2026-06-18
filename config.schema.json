@@ -2,7 +2,7 @@
   "pluginAlias": "HiveThermostat",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes Hive heating zones and hot water to HomeKit via the Hive cloud API.\n\n**First-time setup with 2FA:** enter your username and password and restart. If your account uses SMS two-factor authentication, check the Homebridge log — you'll be prompted to enter the SMS code in the **2FA Code** field below, then restart once more. After that the field can be left blank.",
+  "headerDisplay": "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/florida117/Homebridge-Hive-Thermostat/main/branding/hive_logo.png\" width=\"100\"></p>\n\nExposes Hive heating zones and hot water to HomeKit via the Hive cloud API.\n\n**First-time setup with 2FA:** enter your username and password and restart. If your account uses SMS two-factor authentication, check the Homebridge log — you'll be prompted to enter the SMS code in the **2FA Code** field below, then restart once more. After that the field can be left blank.",
   "footerDisplay": "For help and issues see the project's GitHub repository.",
   "schema": {
     "type": "object",
