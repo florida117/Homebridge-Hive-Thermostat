@@ -4,6 +4,8 @@
 
 # homebridge-hive-thermostat
 
+[![verified-by-homebridge](https://img.shields.io/badge/_-verified-blueviolet?color=%23491F59&style=flat&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
+
 A Homebridge plugin that exposes **Hive heating zones and hot water** to Apple HomeKit, talking directly to the Hive cloud API.
 
 It was written as a modern replacement for older Hive plugins that broke when Hive moved to AWS Cognito authentication with mandatory SMS two-factor auth. Authentication, token refresh, and the 2FA handshake are all handled here.
