@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.4] - 2026-08-10
+### Fixed
+- Hot water commands sent over Matter acted on state captured when the
+  accessory was registered, rather than current state. Toggling hot water from
+  a Matter controller could send the opposite of the intended command, and
+  cancelling a boost could restore a mode the zone had long since left.
+- Login could hang Homebridge startup indefinitely, with no error logged, if
+  the Hive account returned a Cognito challenge other than SMS 2FA (for example
+  a required password change). These now fail with an actionable message.
+- A non-numeric `pollInterval` in the config resulted in continuous polling of
+  the Hive API instead of the configured interval. `pollInterval` and
+  `hotWaterDurationMinutes` are now validated.
+- Slow Hive responses could cause overlapping poll cycles that each refreshed
+  the access token independently. Poll cycles no longer overlap.
+- An expired token during a poll discarded that cycle, leaving HomeKit with
+  stale state until the next one. The poll is now retried after the refresh.
+- Newly registered accessories were missing from the platform's internal
+  accessory list, and removed ones were left in it.
+
+### Changed
+- Matter accessory state is only written when it has actually changed, instead
+  of on every poll. This removes a Matter transaction per accessory every poll
+  interval for state that is usually unchanged.
+- `engines.node` now includes Node 26.
+
+### Internal
+- `npm run lint` now works: ESLint was referenced by the script but was never a
+  dependency and had no configuration.
+- Added a CI workflow running lint and build across Node 22, 24 and 26.
+
 ## [1.0.3] - 2026-06-18
 ### Fixed
 - Pin `form-data` to `^4.0.6` via overrides to resolve a high-severity CRLF
