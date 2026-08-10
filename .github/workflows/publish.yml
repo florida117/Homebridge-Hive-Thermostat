@@ -8,6 +8,11 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
+    # Needed by the final step to create the GitHub Release.
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -22,7 +27,38 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Everything that can reject the release runs before the publish step,
+      # because npm publish is effectively irreversible.
+      - name: Check tag matches package.json version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p 'require("./package.json").version')"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "Tag $GITHUB_REF_NAME implies version $tag_version," \
+                 "but package.json is $pkg_version." >&2
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          .github/scripts/extract-changelog.sh "${GITHUB_REF_NAME#v}" \
+            > release-notes.md
+          echo "--- release notes ---"
+          cat release-notes.md
+
       - name: Publish
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+
+      # A tag alone does not create a GitHub Release, and the Homebridge UI
+      # reads its "what's new" text from the Releases API — without this the
+      # plugin update shows no notes.
+      - name: Create GitHub Release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
