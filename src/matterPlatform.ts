@@ -38,6 +38,20 @@ export class HiveMatterPlatform {
   /** Whether the current/last registration attempt includes preset attributes. */
   private activePresets = false;
 
+  /**
+   * Latest hot water state per Hive product id. Matter accessories (and their
+   * command handlers) are built once at registration, so a handler that read
+   * its captured `hw` would act on a snapshot that goes stale within one poll.
+   * Handlers read through here instead.
+   */
+  private readonly latestHotWater = new Map<string, HiveHotWater>();
+
+  /**
+   * Last attribute payload written per accessory UUID, so a poll that produces
+   * identical state doesn't queue redundant Matter writes.
+   */
+  private readonly lastWritten = new Map<string, string>();
+
   constructor(
     private readonly api: MatterApiHost,
     private readonly log: Logger,
@@ -184,6 +198,9 @@ export class HiveMatterPlatform {
     }
     const previous = [...this.cached.values()];
     this.cached.clear();
+    // Fresh endpoints are created with the cluster values passed at
+    // registration, so the change-detection baseline must not survive them.
+    this.lastWritten.clear();
     try {
       await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, previous);
     } catch (err) {
@@ -236,30 +253,49 @@ export class HiveMatterPlatform {
     // accessory; re-writing them every poll is pointless work (they are not
     // writable and would be silently reverted by the Matter thermostat server).
     const { Thermostat } = matter.types;
-    await matter.updateAccessoryState(
-      this.heatingUuid(zone.id),
-      matter.clusterNames.Thermostat,
-      {
-        localTemperature: this.toMatterTemperature(zone.currentTemperature),
-        occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
-        systemMode: this.matterModeFromHive(zone.mode),
-        thermostatRunningMode: zone.heating
-          ? Thermostat.ThermostatRunningMode.Heat
-          : Thermostat.ThermostatRunningMode.Off,
-      },
-    );
+    const uuid = this.heatingUuid(zone.id);
+    const state = {
+      localTemperature: this.toMatterTemperature(zone.currentTemperature),
+      occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
+      systemMode: this.matterModeFromHive(zone.mode),
+      thermostatRunningMode: zone.heating
+        ? Thermostat.ThermostatRunningMode.Heat
+        : Thermostat.ThermostatRunningMode.Off,
+    };
+    await this.writeIfChanged(uuid, matter.clusterNames.Thermostat, state);
   }
 
   async updateHotWater(hw: HiveHotWater): Promise<void> {
+    // Track the latest state even when Matter is off/unregistered, so command
+    // handlers never fall back to a stale registration-time snapshot.
+    this.latestHotWater.set(hw.id, hw);
     if (!this.enabled || !this.registered) {
       return;
     }
     const matter = this.api.matter!;
-    await matter.updateAccessoryState(
-      this.hotWaterUuid(hw.id),
-      matter.clusterNames.OnOff,
-      { onOff: hw.boosting },
-    );
+    await this.writeIfChanged(this.hotWaterUuid(hw.id), matter.clusterNames.OnOff, {
+      onOff: hw.boosting,
+    });
+  }
+
+  /**
+   * Write `state` only when it differs from the last payload written for
+   * `uuid`. Hive is polled every 15s but rarely changes, so this turns most
+   * polls into no-ops instead of a Matter write per accessory per cycle. The
+   * payload is recorded only after a successful write, so a failed one is
+   * retried on the next poll.
+   */
+  private async writeIfChanged(
+    uuid: string,
+    cluster: string,
+    state: Record<string, unknown>,
+  ): Promise<void> {
+    const encoded = JSON.stringify(state);
+    if (this.lastWritten.get(uuid) === encoded) {
+      return;
+    }
+    await this.api.matter!.updateAccessoryState(uuid, cluster, state);
+    this.lastWritten.set(uuid, encoded);
   }
 
   private heatingAccessory(
@@ -325,12 +361,12 @@ export class HiveMatterPlatform {
             this.commands.pollSoon();
           },
           off: async () => {
-            await this.commands.cancelHotWaterBoost(hw.id, hw.previousMode);
+            await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
             this.commands.pollSoon();
           },
           toggle: async () => {
-            if (hw.boosting) {
-              await this.commands.cancelHotWaterBoost(hw.id, hw.previousMode);
+            if (this.current(hw).boosting) {
+              await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
             } else {
               await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
             }
@@ -339,6 +375,16 @@ export class HiveMatterPlatform {
         },
       },
     };
+  }
+
+  /** The freshest known state for a hot water product, falling back to the
+   * registration-time snapshot if no poll has landed yet. */
+  private current(hw: HiveHotWater): HiveHotWater {
+    return this.latestHotWater.get(hw.id) ?? hw;
+  }
+
+  private previousMode(hw: HiveHotWater): HiveMode {
+    return this.current(hw).previousMode;
   }
 
   private heatingCluster(zone: HiveHeatingZone) {

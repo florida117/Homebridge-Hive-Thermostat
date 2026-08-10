@@ -16,6 +16,17 @@ import { fetchWithTimeout } from './fetchWithTimeout';
 
 export type HiveMode = 'SCHEDULE' | 'MANUAL' | 'OFF' | 'BOOST';
 
+/**
+ * Write hosts in preference order. The main beekeeper host (which also serves
+ * reads) is tried first; the regional `-uk` host is a fallback for accounts
+ * that need it. We fall through to the next host on a gateway-level rejection
+ * (403/404) — the AWS API Gateway in front of Hive returns those when the host
+ * doesn't route the request, so the alternate host is worth a try.
+ */
+const WRITE_BASES: readonly string[] = [
+  ...new Set([HIVE_URLS.beekeeperBase, HIVE_URLS.beekeeperWriteBase]),
+];
+
 export interface HiveHeatingZone {
   id: string;
   type: 'heating';
@@ -157,17 +168,6 @@ export class HiveApi {
     };
   }
 
-  /**
-   * Write hosts in preference order. The main beekeeper host (which also serves
-   * reads) is tried first; the regional `-uk` host is a fallback for accounts
-   * that need it. We fall through to the next host on a gateway-level rejection
-   * (403/404) — the AWS API Gateway in front of Hive returns those when the host
-   * doesn't route the request, so the alternate host is worth a try.
-   */
-  private getWriteBases(): string[] {
-    return [...new Set([HIVE_URLS.beekeeperBase, HIVE_URLS.beekeeperWriteBase])];
-  }
-
   /** POST a state change to a node. */
   private async setNodeState(
     type: 'heating' | 'hotwater',
@@ -176,7 +176,7 @@ export class HiveApi {
   ): Promise<void> {
     let lastError: Error | undefined;
 
-    for (const base of this.getWriteBases()) {
+    for (const base of WRITE_BASES) {
       const url = `${base}/nodes/${type}/${id}`;
       const res = await fetchWithTimeout(url, {
         method: 'POST',
