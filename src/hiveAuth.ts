@@ -41,14 +41,6 @@ export class HiveAuth {
   private poolConfig?: PoolConfig;
   private userPool?: CognitoUserPool;
   private cognitoUser?: CognitoUser;
-  private session?: CognitoUserSession;
-
-  /** Pending MFA continuation captured between login() and submitSms(). */
-  private mfaCallback?: {
-    resolve: (s: CognitoUserSession) => void;
-    reject: (e: Error) => void;
-    user: CognitoUser;
-  };
 
   constructor(
     private readonly username: string,
@@ -136,20 +128,46 @@ export class HiveAuth {
       this.cognitoUser!.authenticateUser(authDetails, {
         onSuccess: (s) => resolve(s),
         onFailure: (err) => reject(err),
-        // Hive uses SMS_MFA. Capture the continuation so submitSms() can
-        // complete it.
-        totpRequired: () => {
-          this.mfaCallback = { resolve, reject, user: this.cognitoUser! };
-          reject(new HiveSmsRequired());
-        },
-        mfaRequired: () => {
-          this.mfaCallback = { resolve, reject, user: this.cognitoUser! };
-          reject(new HiveSmsRequired());
-        },
+        // Hive uses SMS_MFA. submitSms() completes the challenge via
+        // cognitoUser.sendMFACode().
+        totpRequired: () => reject(new HiveSmsRequired()),
+        mfaRequired: () => reject(new HiveSmsRequired()),
+        // Cognito settles authenticateUser through exactly one callback. Any
+        // challenge we don't provide a handler for would leave this promise
+        // pending forever and hang Homebridge startup with no explanation, so
+        // reject with something the user can act on instead.
+        newPasswordRequired: () =>
+          reject(
+            new Error(
+              'Hive requires a new password to be set. Sign in at ' +
+                'sso.hivehome.com, complete the password change, then update ' +
+                'the plugin config.',
+            ),
+          ),
+        mfaSetup: () =>
+          reject(
+            new Error(
+              'Hive requires two-factor authentication to be set up. Complete ' +
+                'MFA setup at sso.hivehome.com, then restart Homebridge.',
+            ),
+          ),
+        selectMFAType: () =>
+          reject(
+            new Error(
+              'Hive asked which MFA method to use, which this plugin cannot ' +
+                'answer. Set SMS as the default MFA method in your Hive account.',
+            ),
+          ),
+        customChallenge: () =>
+          reject(
+            new Error(
+              'Hive returned an unsupported custom login challenge. Please open ' +
+                'a GitHub issue with your Homebridge log.',
+            ),
+          ),
       });
     });
 
-    this.session = session;
     return this.tokensFromSession(session);
   }
 
@@ -173,8 +191,6 @@ export class HiveAuth {
       );
     });
 
-    this.session = session;
-    this.mfaCallback = undefined;
     return this.tokensFromSession(session);
   }
 
@@ -198,7 +214,6 @@ export class HiveAuth {
       });
     });
 
-    this.session = session;
     return this.tokensFromSession(session);
   }
 

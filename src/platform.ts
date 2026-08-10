@@ -59,6 +59,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
   private readonly tokenStorePath: string;
   private pollTimer?: NodeJS.Timeout;
+  /** True while a poll is in flight, so cycles cannot overlap. */
+  private polling = false;
   private readonly pollIntervalMs: number;
   private readonly hotWaterBoostMinutes: number;
   private readonly matterPlatform?: HiveMatterPlatform;
@@ -78,12 +80,16 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     this.Characteristic = homebridgeApi.hap.Characteristic;
     this.cfg = config as HiveConfig;
 
-    this.pollIntervalMs = Math.max(
-      MIN_POLL_INTERVAL_MS,
-      (this.cfg.pollInterval ?? DEFAULT_POLL_INTERVAL_MS / 1000) * 1000,
-    );
+    // Guard against a non-numeric pollInterval in config: `NaN` would survive
+    // Math.max and make setInterval fire continuously, hammering the Hive API.
+    const configuredSeconds = Number(this.cfg.pollInterval);
+    this.pollIntervalMs = Number.isFinite(configuredSeconds)
+      ? Math.max(MIN_POLL_INTERVAL_MS, configuredSeconds * 1000)
+      : DEFAULT_POLL_INTERVAL_MS;
 
-    this.hotWaterBoostMinutes = this.cfg.hotWaterDurationMinutes ?? 30;
+    const boostMinutes = Number(this.cfg.hotWaterDurationMinutes);
+    this.hotWaterBoostMinutes =
+      Number.isFinite(boostMinutes) && boostMinutes > 0 ? boostMinutes : 30;
     if (this.cfg.enableMatter !== false) {
       this.matterPlatform = new HiveMatterPlatform(
         this.homebridgeApi,
@@ -278,6 +284,15 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     const stale = this.accessories.filter((a) => !liveIds.has(a.context.hiveId));
     if (stale.length) {
       this.homebridgeApi.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
+      // Homebridge does not prune our own cache, so drop them here too — an
+      // unregistered accessory left in the list would be matched by UUID on a
+      // later discovery and handed to a handler that HomeKit no longer knows.
+      for (const accessory of stale) {
+        const index = this.accessories.indexOf(accessory);
+        if (index >= 0) {
+          this.accessories.splice(index, 1);
+        }
+      }
     }
 
     // Seed initial values.
@@ -292,6 +307,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       accessory = new this.homebridgeApi.platformAccessory(name, uuid);
       accessory.context.hiveId = id;
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      // configureAccessory() only fires for accessories restored from cache, so
+      // newly created ones have to be tracked here.
+      this.accessories.push(accessory);
     } else if (accessory.displayName !== name) {
       // Keep the cached accessory's name in sync if Hive's name changed.
       accessory.displayName = name;
@@ -307,6 +325,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       accessory = new this.homebridgeApi.platformAccessory(name, uuid);
       accessory.context.hiveId = id;
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.push(accessory);
     } else if (accessory.displayName !== name) {
       accessory.displayName = name;
       this.homebridgeApi.updatePlatformAccessories([accessory]);
@@ -320,17 +339,35 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     this.pollTimer = setInterval(() => this.pollOnce(), this.pollIntervalMs);
   }
 
-  /** A single poll cycle: fetch state and push it to the accessories. */
+  /**
+   * A single poll cycle: fetch state and push it to the accessories.
+   *
+   * Guarded against overlap — the request timeout (15s) is the same as the
+   * default poll interval, so a slow Hive response could otherwise stack up
+   * concurrent polls that each retry auth and fight over the token.
+   */
   private async pollOnce(): Promise<void> {
+    if (this.polling) {
+      return;
+    }
+    this.polling = true;
     try {
-      const state = await this.api!.getState();
-      this.applyState(state);
+      this.applyState(await this.api!.getState());
     } catch (err) {
       if (err instanceof TokenExpiredError) {
+        // Refresh and retry immediately rather than serving stale state until
+        // the next tick.
         await this.refreshTokens();
+        try {
+          this.applyState(await this.api!.getState());
+        } catch (retryErr) {
+          this.log.debug(`Hive poll retry failed: ${(retryErr as Error).message}`);
+        }
       } else {
         this.log.debug(`Hive poll error: ${(err as Error).message}`);
       }
+    } finally {
+      this.polling = false;
     }
   }
 
@@ -346,6 +383,13 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
     this.pollSoonTimer = setTimeout(() => {
       this.pollSoonTimer = undefined;
+      if (this.polling) {
+        // A regular poll is already in flight and may have read Hive before the
+        // command landed, so its result can't confirm anything. Re-arm rather
+        // than let the overlap guard drop this cycle.
+        this.pollSoon(1000);
+        return;
+      }
       void this.pollOnce();
     }, delayMs);
   }
@@ -391,6 +435,12 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
   /** Exposed so accessories can issue control commands. */
   get hive(): HiveApi {
-    return this.api!;
+    if (!this.api) {
+      // Cached Matter endpoints can stay live across a restart and accept a
+      // command before auth finishes. Fail with something diagnosable rather
+      // than a bare "cannot read properties of undefined".
+      throw new Error('Hive is not authenticated yet — command ignored.');
+    }
+    return this.api;
   }
 }
