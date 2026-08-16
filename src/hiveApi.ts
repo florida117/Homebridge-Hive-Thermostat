@@ -245,3 +245,18 @@ export class TokenExpiredError extends Error {
     this.name = 'TokenExpiredError';
   }
 }
+
+/**
+ * Raised when a command arrives before Hive authentication has finished.
+ *
+ * Cached Matter endpoints stay live across a restart and can accept a command
+ * within milliseconds of boot, long before the Cognito round-trip completes.
+ * The Matter layer maps this to an InvalidInState status so the controller is
+ * told the device is not ready yet, rather than that the command failed.
+ */
+export class HiveNotReadyError extends Error {
+  constructor() {
+    super('Hive is not authenticated yet — command ignored.');
+    this.name = 'HiveNotReadyError';
+  }
+}

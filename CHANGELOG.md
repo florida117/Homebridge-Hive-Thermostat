@@ -2,6 +2,62 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.5] - 2026-08-16
+
+**If your Hive heating zones stopped appearing over Matter after updating to
+Homebridge 2.3.0 or later, this release fixes it.** Homebridge 2.3.0 changed how
+a plugin's Matter thermostat is built, which caused this plugin's thermostat
+endpoints to fail validation and never come online. Hot water was unaffected,
+and normal HomeKit (non-Matter) accessories were never affected. No
+configuration changes are needed. Homebridge 2.4.0 or later is recommended.
+
+### Fixed
+- **Matter thermostats failed to register on Homebridge 2.3.0 and later.**
+  Homebridge 2.3.0 changed `deviceTypes.Thermostat` from a type pre-composed
+  with Heating/Cooling/AutoMode/Occupancy to a bare device type whose features
+  are detected from the setpoints an accessory declares. Declaring only a
+  heating setpoint left the endpoint with Heating alone, and the hardcoded
+  `occupancy` attribute was then rejected with `Conformance "OCC": Matter does
+  not allow you to set this attribute`, taking the whole thermostat endpoint
+  down. The `occupancy` attribute has been removed — Hive has no occupancy
+  sensing and it was always a hardcoded `true`.
+- **Every thermostat setpoint update would have been rejected** once AutoMode
+  was live, with "Thermostat setpoints could not be reconciled within the
+  configured limits". matter.js 0.17.7 (shipped in Homebridge 2.3.0) began
+  validating the whole thermostat cluster rather than only the attribute being
+  written, and the undeclared cooling limits fell back to the spec's 16–32°C,
+  which cannot satisfy the default 2°C deadband against a 5–32°C heating range.
+  The cooling limits and a zero deadband are now declared explicitly.
+
+### Changed
+- Matter thermostat features are now composed explicitly via
+  `api.matter.deviceRequirements` on Homebridge 2.4.0+, so Heating, Cooling and
+  AutoMode are pinned rather than inferred. On 2.3.x, where a plugin cannot
+  override detection, the declared cooling setpoint makes Homebridge derive the
+  same feature set. The Hive schedule therefore stays available as Matter Auto
+  on every supported Homebridge version. Cooling remains inert: the control
+  sequence is HeatingOnly and the cooling setpoint is pinned to the top of the
+  range.
+- Matter commands that arrive before Hive authentication completes now return
+  an `InvalidInState` Matter status via `api.matter.status` (Homebridge 2.3.0+)
+  rather than a generic failure, so a controller can retry instead of showing
+  the command as failed.
+
+### Removed
+- The Matter Presets guess-retry-and-remember machinery. The feature set is now
+  derived from observable properties of the running Homebridge rather than
+  guessed, so the failed first registration attempt, the re-registration retry
+  and the persisted `.hive-thermostat-matter.json` decision file are all gone.
+  Presets is declared only on Homebridge ≤ 2.2.x, where a bug in Homebridge's
+  cluster-feature detection left matter.js's default feature set (which
+  includes Presets) live on the endpoint and made `presetTypes` mandatory.
+  An existing `.hive-thermostat-matter.json` in the Homebridge storage
+  directory is now unused and can be deleted.
+
+### Internal
+- Development dependency on `homebridge` bumped to `^2.4.0`. The supported
+  range in `engines` is unchanged at `>=2.0.0`.
+
 ## [1.0.4] - 2026-08-10
 ### Fixed
 - Hot water commands sent over Matter acted on state captured when the

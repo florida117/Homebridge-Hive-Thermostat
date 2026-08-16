@@ -32,7 +32,7 @@ import {
   MIN_POLL_INTERVAL_MS,
 } from './settings';
 import { HiveAuth, HiveSmsRequired, HiveTokens } from './hiveAuth';
-import { HiveApi, HiveState, TokenExpiredError } from './hiveApi';
+import { HiveApi, HiveNotReadyError, HiveState, TokenExpiredError } from './hiveApi';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
 import { HiveMatterPlatform } from './matterPlatform';
@@ -103,10 +103,6 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
           pollSoon: () => this.pollSoon(),
         },
         this.hotWaterBoostMinutes,
-        path.join(
-          this.homebridgeApi.user.storagePath(),
-          '.hive-thermostat-matter.json',
-        ),
       );
     }
 
@@ -438,8 +434,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     if (!this.api) {
       // Cached Matter endpoints can stay live across a restart and accept a
       // command before auth finishes. Fail with something diagnosable rather
-      // than a bare "cannot read properties of undefined".
-      throw new Error('Hive is not authenticated yet — command ignored.');
+      // than a bare "cannot read properties of undefined" — the Matter layer
+      // turns this into an InvalidInState status (see HiveMatterPlatform).
+      throw new HiveNotReadyError();
     }
     return this.api;
   }
