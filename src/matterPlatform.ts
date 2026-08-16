@@ -1,7 +1,6 @@
 import type { Logger, MatterAccessory, MatterAPI } from 'homebridge';
-import { promises as fs } from 'fs';
 import { HIVE_MAX_TEMP, HIVE_MIN_TEMP, PLATFORM_NAME, PLUGIN_NAME } from './settings';
-import { HiveHeatingZone, HiveHotWater, HiveMode } from './hiveApi';
+import { HiveHeatingZone, HiveHotWater, HiveMode, HiveNotReadyError } from './hiveApi';
 
 type MatterApiHost = {
   isMatterEnabled?: () => boolean;
@@ -24,19 +23,43 @@ type HiveMatterContext = {
 const CELSIUS_TO_MATTER = 100;
 
 /**
- * Default assumption for the Matter Presets feature on a first run (no
- * remembered value). Current Homebridge 2.x runtime thermostats require a
- * non-empty `presetTypes` array, and the device-type template cannot be trusted
- * to reveal this (see register()). Defaulting to enabled makes the common case
- * succeed on the first attempt; the self-healing retry covers the exceptions.
+ * The Matter Thermostat features this plugin composes when Homebridge lets it
+ * choose (Homebridge >= 2.4.0, via `api.matter.deviceRequirements`).
+ *
+ * Hive only heats, so Heating is the one we actually want. AutoMode carries the
+ * Hive schedule, which HomeKit has no other way to express — and the Matter spec
+ * conforms HEAT and COOL as "AUTO, O.a+", meaning AutoMode requires BOTH heating
+ * and cooling. Cooling is therefore along for the ride and stays inert:
+ * controlSequenceOfOperation is HeatingOnly and the cooling setpoint is pinned
+ * to the top of the range (see heatingCluster()).
+ *
+ * Occupancy is deliberately absent. The old code declared a hardcoded
+ * `occupancy: { occupied: true }`, which advertised a capability Hive does not
+ * have and is rejected outright once the feature is not composed.
  */
-const DEFAULT_PRESETS_ENABLED = true;
+const THERMOSTAT_FEATURES = ['Heating', 'Cooling', 'AutoMode'] as const;
+
+/**
+ * How the thermostat endpoint will be built on the running Homebridge.
+ *
+ * This is NOT a guess — see composeThermostat() for how each regime is detected.
+ * Heating/Cooling/AutoMode end up live in every supported regime; the only
+ * thing that varies is whether Presets is forced on.
+ */
+type ThermostatComposition = {
+  /** The device type to register, composed by us where that is supported. */
+  deviceType: MatterAccessory['deviceType'];
+  /** Presets live: a non-empty `presetTypes` array is REQUIRED. */
+  presets: boolean;
+  /** Human-readable regime, for the startup log. */
+  regime: string;
+};
 
 export class HiveMatterPlatform {
   private readonly cached = new Map<string, MatterAccessory<HiveMatterContext>>();
   private registered = false;
-  /** Whether the current/last registration attempt includes preset attributes. */
-  private activePresets = false;
+  /** Resolved once per registration by composeThermostat(). */
+  private thermostat?: ThermostatComposition;
 
   /**
    * Latest hot water state per Hive product id. Matter accessories (and their
@@ -57,12 +80,6 @@ export class HiveMatterPlatform {
     private readonly log: Logger,
     private readonly commands: HiveMatterCommands,
     private readonly hotWaterBoostMinutes: number,
-    /**
-     * Optional path used to remember the working Matter Presets decision
-     * across restarts, so subsequent starts skip the failed first attempt.
-     * When omitted, persistence is disabled.
-     */
-    private readonly presetsStorePath?: string,
   ) {}
 
   get enabled(): boolean {
@@ -95,90 +112,93 @@ export class HiveMatterPlatform {
       return;
     }
 
-    // Whether the Matter thermostat needs preset attributes depends on the
-    // running Homebridge build, and it CANNOT be read reliably from the device
-    // type: Homebridge wraps the thermostat in its own runtime behaviour
-    // (HomebridgeThermostatServer), so the device-type template can report
-    // presets:false while the live endpoint still requires a non-empty
-    // presetTypes array. Current Homebridge 2.x builds require it, so we default
-    // the first guess to "enabled". We then verify each thermostat endpoint
-    // actually came online — a thermostat that failed validation never enters
-    // the live accessory map, so getAccessoryState stays undefined — and flip +
-    // re-register once if the guess was wrong. The working value is remembered
-    // so later restarts skip the verification round-trip entirely.
-    const remembered = await this.loadPersistedPresets();
-    this.activePresets = remembered ?? DEFAULT_PRESETS_ENABLED;
-    if (remembered !== undefined) {
-      this.log.info(`Hive: using remembered Matter Presets setting = ${remembered}.`);
-    }
+    this.thermostat = this.composeThermostat(matter);
+    this.log.info(
+      `Hive: Matter thermostat — ${this.thermostat.regime} ` +
+        `(Presets=${this.thermostat.presets}).`,
+    );
+
     await this.registerWith(matter, state);
 
-    let ok = state.zones.length === 0 || (await this.verifyThermostats(matter, state));
-    if (!ok) {
-      this.log.warn(
-        `Hive: thermostat(s) did not register with Presets=${this.activePresets}; ` +
-          `retrying with Presets=${!this.activePresets}.`,
+    // Verification is now a health check rather than a retry trigger: the
+    // feature set is derived, not guessed, so a failure here means something
+    // genuinely unexpected and is worth a loud, actionable log line. A
+    // thermostat that fails validation never enters the live accessory map, so
+    // its state stays unreadable.
+    if (state.zones.length > 0 && !(await this.verifyThermostats(matter, state))) {
+      this.log.error(
+        'Hive: thermostat endpoint(s) did not come online. Please open a GitHub ' +
+          'issue with the Homebridge log and your Homebridge version.',
       );
-      this.activePresets = !this.activePresets;
-      await this.unregisterCached(matter);
-      await this.registerWith(matter, state);
-      ok = await this.verifyThermostats(matter, state);
-      if (ok) {
-        this.log.info(
-          `Hive: thermostats registered after retry with Presets=${this.activePresets}.`,
-        );
-      } else {
-        this.log.error(
-          'Hive: thermostats still failed to register after retrying the Presets ' +
-            'setting. Please open a GitHub issue with the Homebridge log.',
-        );
-      }
-    }
-
-    // Remember the working decision (only when there were thermostats to
-    // verify, and only when it changed) so the next restart starts correct.
-    if (ok && state.zones.length > 0 && this.activePresets !== remembered) {
-      await this.savePersistedPresets(this.activePresets);
     }
 
     this.registered = true;
   }
 
-  /** Read the remembered Presets decision, or undefined if none/unavailable. */
-  private async loadPersistedPresets(): Promise<boolean | undefined> {
-    if (!this.presetsStorePath) {
-      return undefined;
+  /**
+   * Decide the thermostat device type and the feature set that will be live on
+   * it. Three Homebridge generations behave differently here, and each is
+   * identified by an observable property rather than a version string:
+   *
+   * • Homebridge >= 2.4.0 — `api.matter.deviceRequirements` exists, so we
+   *   compose the cluster ourselves and Homebridge leaves our choice alone
+   *   (AccessoryManager skips detection when `behaviors.thermostat` is set).
+   *   This is the only regime where we are fully in control.
+   *
+   * • Homebridge <= 2.2.x — `deviceTypes.Thermostat` arrives pre-composed with
+   *   Heating/Cooling/AutoMode/Occupancy. Homebridge then replaces the server
+   *   with HomebridgeThermostatServer, and its feature detection was broken
+   *   (it read `cluster.supportedFeatures`, which is never populated, so it
+   *   always fell back to "no features"). The live endpoint therefore ends up
+   *   with matter.js's ThermostatServer defaults — Heating, Cooling, Occupancy,
+   *   AutoMode AND Presets — which is why a non-empty `presetTypes` was
+   *   mandatory on these builds.
+   *
+   * • Homebridge 2.3.x — the device type is bare and the detection bug is
+   *   fixed, but there is no way to override the detected features. We do not
+   *   need one: detectThermostatFeatures() reads the declared setpoints, and
+   *   because heatingCluster() always declares a cooling setpoint alongside the
+   *   heating one it derives exactly Heating/Cooling/AutoMode — the same set we
+   *   compose explicitly above. Presets is never detected, so it stays off.
+   */
+  private composeThermostat(matter: MatterAPI): ThermostatComposition {
+    const base = matter.deviceTypes.Thermostat;
+
+    // Optional at runtime: older Homebridge has no such property.
+    const requirements = (matter as Partial<MatterAPI>).deviceRequirements
+      ?.Thermostat?.ThermostatServer;
+    if (requirements) {
+      return {
+        deviceType: base.with(requirements.with(...THERMOSTAT_FEATURES)),
+        presets: false,
+        regime: 'Homebridge >= 2.4.0, features composed by the plugin',
+      };
     }
-    try {
-      const raw = await fs.readFile(this.presetsStorePath, 'utf8');
-      const value = JSON.parse(raw).presets;
-      return typeof value === 'boolean' ? value : undefined;
-    } catch {
-      return undefined;
+
+    // A pre-composed device type carries its thermostat behavior; the bare
+    // ThermostatDevice that 2.3.x hands out does not.
+    if ((base as { behaviors?: Record<string, unknown> }).behaviors?.thermostat) {
+      return {
+        deviceType: base,
+        presets: true,
+        regime: 'Homebridge <= 2.2.x, pre-composed device type',
+      };
     }
+
+    return {
+      deviceType: base,
+      presets: false,
+      regime: 'Homebridge 2.3.x, features detected from the declared setpoints',
+    };
   }
 
-  /** Persist the working Presets decision for the next restart. */
-  private async savePersistedPresets(value: boolean): Promise<void> {
-    if (!this.presetsStorePath) {
-      return;
-    }
-    try {
-      await fs.writeFile(this.presetsStorePath, JSON.stringify({ presets: value }));
-    } catch (err) {
-      this.log.debug(
-        `Hive: could not persist Matter Presets setting: ${(err as Error).message}`,
-      );
-    }
-  }
-
-  /** Build and register all accessories using the current Presets decision. */
+  /** Build and register all accessories using the resolved composition. */
   private async registerWith(
     matter: MatterAPI,
     state: { zones: HiveHeatingZone[]; hotWater: HiveHotWater[] },
   ): Promise<void> {
     const accessories = [
-      ...state.zones.map((zone) => this.heatingAccessory(matter, zone)),
+      ...state.zones.map((zone) => this.heatingAccessory(zone)),
       ...state.hotWater.map((hw) => this.hotWaterAccessory(matter, hw)),
     ];
     if (!accessories.length) {
@@ -254,7 +274,7 @@ export class HiveMatterPlatform {
     // writable and would be silently reverted by the Matter thermostat server).
     const { Thermostat } = matter.types;
     const uuid = this.heatingUuid(zone.id);
-    const state = {
+    const state: Record<string, unknown> = {
       localTemperature: this.toMatterTemperature(zone.currentTemperature),
       occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
       systemMode: this.matterModeFromHive(zone.mode),
@@ -298,19 +318,41 @@ export class HiveMatterPlatform {
     this.lastWritten.set(uuid, encoded);
   }
 
-  private heatingAccessory(
-    matter: MatterAPI,
-    zone: HiveHeatingZone,
-  ): MatterAccessory<HiveMatterContext> {
+  /**
+   * Run a control handler, translating "not ready yet" into a Matter status
+   * the controller can act on.
+   *
+   * Homebridge already wraps an unrecognised handler error as a generic
+   * Status.Failure, which reads to a controller as "the command was attempted
+   * and failed". A command that arrived before Hive authentication finished was
+   * never attempted, so InvalidInState is the honest answer — the controller
+   * can retry rather than surface a failure to the user. `api.matter.status` is
+   * read off the api object rather than value-imported from `homebridge`, which
+   * would break on installs that keep Homebridge in a separate node_modules
+   * tree. It is absent before Homebridge 2.3.0, hence the fallback.
+   */
+  private async command(run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (err) {
+      const status = (this.api.matter as Partial<MatterAPI> | undefined)?.status;
+      if (err instanceof HiveNotReadyError && status) {
+        throw new status.InvalidInState(err.message);
+      }
+      throw err;
+    }
+  }
+
+  private heatingAccessory(zone: HiveHeatingZone): MatterAccessory<HiveMatterContext> {
     return {
       UUID: this.heatingUuid(zone.id),
       displayName: zone.name,
-      // Use Homebridge's bridge-provided type so Matter behavior classes come
-      // from the running Homebridge instance, not this plugin's dependency tree.
-      // It advertises Heating/Cooling/Occupancy/AutoMode, so the Home app shows
-      // Off/Cool/Heat/Auto. Cool is inert (Hive cannot cool) but Auto is mapped
+      // Built from Homebridge's bridge-provided type so Matter behavior classes
+      // come from the running Homebridge instance, not this plugin's dependency
+      // tree — composed with our own feature set where that is supported. See
+      // composeThermostat(). Cool is inert (Hive cannot cool) but Auto is mapped
       // to the Hive schedule — see matterModeFromHive()/hiveModeFromMatter().
-      deviceType: matter.deviceTypes.Thermostat,
+      deviceType: this.thermostat!.deviceType,
       manufacturer: 'Hive',
       model: 'Heating Zone',
       serialNumber: this.serialNumber(zone.id),
@@ -320,20 +362,22 @@ export class HiveMatterPlatform {
       },
       handlers: {
         thermostat: {
-          systemModeChange: async ({ systemMode }) => {
-            await this.commands.setHeatingMode(
-              zone.id,
-              this.hiveModeFromMatter(systemMode),
-            );
-            this.commands.pollSoon();
-          },
-          occupiedHeatingSetpointChange: async ({ occupiedHeatingSetpoint }) => {
-            await this.commands.setHeatingTarget(
-              zone.id,
-              occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
-            );
-            this.commands.pollSoon();
-          },
+          systemModeChange: ({ systemMode }) =>
+            this.command(async () => {
+              await this.commands.setHeatingMode(
+                zone.id,
+                this.hiveModeFromMatter(systemMode),
+              );
+              this.commands.pollSoon();
+            }),
+          occupiedHeatingSetpointChange: ({ occupiedHeatingSetpoint }) =>
+            this.command(async () => {
+              await this.commands.setHeatingTarget(
+                zone.id,
+                occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
+              );
+              this.commands.pollSoon();
+            }),
         },
       },
     };
@@ -356,22 +400,25 @@ export class HiveMatterPlatform {
       },
       handlers: {
         onOff: {
-          on: async () => {
-            await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
-            this.commands.pollSoon();
-          },
-          off: async () => {
-            await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
-            this.commands.pollSoon();
-          },
-          toggle: async () => {
-            if (this.current(hw).boosting) {
-              await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
-            } else {
+          on: () =>
+            this.command(async () => {
               await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
-            }
-            this.commands.pollSoon();
-          },
+              this.commands.pollSoon();
+            }),
+          off: () =>
+            this.command(async () => {
+              await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
+              this.commands.pollSoon();
+            }),
+          toggle: () =>
+            this.command(async () => {
+              if (this.current(hw).boosting) {
+                await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
+              } else {
+                await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
+              }
+              this.commands.pollSoon();
+            }),
         },
       },
     };
@@ -387,53 +434,75 @@ export class HiveMatterPlatform {
     return this.current(hw).previousMode;
   }
 
-  private heatingCluster(zone: HiveHeatingZone) {
+  private heatingCluster(zone: HiveHeatingZone): Record<string, unknown> {
     const { Thermostat } = this.api.matter!.types;
-    const base = {
+    const min = this.toMatterTemperature(HIVE_MIN_TEMP);
+    const max = this.toMatterTemperature(HIVE_MAX_TEMP);
+
+    const cluster: Record<string, unknown> = {
       localTemperature: this.toMatterTemperature(zone.currentTemperature),
-      occupancy: { occupied: true },
       occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
-      absMinHeatSetpointLimit: this.toMatterTemperature(HIVE_MIN_TEMP),
-      absMaxHeatSetpointLimit: this.toMatterTemperature(HIVE_MAX_TEMP),
-      minHeatSetpointLimit: this.toMatterTemperature(HIVE_MIN_TEMP),
-      maxHeatSetpointLimit: this.toMatterTemperature(HIVE_MAX_TEMP),
+      absMinHeatSetpointLimit: min,
+      absMaxHeatSetpointLimit: max,
+      minHeatSetpointLimit: min,
+      maxHeatSetpointLimit: max,
       // Hive only heats, so advertise a heating-only control sequence even
-      // though the bridge thermostat type also carries the Cooling/AutoMode
-      // features (which is what makes the Home app show Cool/Auto). Auto is
-      // mapped to the Hive schedule; Cool is inert.
+      // when the Cooling feature is present to satisfy AutoMode's conformance.
       controlSequenceOfOperation: Thermostat.ControlSequenceOfOperation.HeatingOnly,
       systemMode: this.matterModeFromHive(zone.mode),
       thermostatRunningMode: zone.heating
         ? Thermostat.ThermostatRunningMode.Heat
         : Thermostat.ThermostatRunningMode.Off,
+
+      // The cooling half is declared for two reasons, and must not be dropped
+      // as "Hive cannot cool":
+      //
+      // 1. It is what makes AutoMode live. On Homebridge 2.3.x we cannot
+      //    compose the cluster, and detectThermostatFeatures() reads exactly
+      //    these attributes — without a cooling setpoint it yields Heating
+      //    alone, and then `systemMode: Auto` (the Hive schedule) and
+      //    thermostatRunningMode are both rejected by conformance.
+      //
+      // 2. ⚠️ AutoMode brings the deadband, and matter.js >= 0.17.7 validates
+      //    the WHOLE cluster rather than just the attribute being written:
+      //      maxCoolSetpointLimit - maxHeatSetpointLimit >= minSetpointDeadBand
+      //      minCoolSetpointLimit - minHeatSetpointLimit >= minSetpointDeadBand
+      //    An undeclared deadband defaults to 2.0°C and undeclared cooling
+      //    limits fall back to the spec's 16–32°C, which against our 5–32°C
+      //    heating range gives 3200 - 3200 = 0 and fails. The symptom is badly
+      //    disconnected from the cause: registration succeeds, then EVERY later
+      //    setpoint update is rejected with "Thermostat setpoints could not be
+      //    reconciled within the configured limits".
+      //
+      // A zero deadband over an identical cooling range keeps both inequalities
+      // trivially satisfiable. Cooling stays inert either way: the control
+      // sequence is HeatingOnly and the cooling setpoint is pinned to the top of
+      // the range, so cool - heat is never negative whatever the user asks for.
+      minSetpointDeadBand: 0,
+      occupiedCoolingSetpoint: max,
+      absMinCoolSetpointLimit: min,
+      absMaxCoolSetpointLimit: max,
+      minCoolSetpointLimit: min,
+      maxCoolSetpointLimit: max,
     };
 
-    // The Matter Presets feature is enabled on some Homebridge / matter.js
-    // builds and disabled on others, with opposite, mutually exclusive
-    // requirements:
-    //   • Presets ENABLED  → presetTypes MUST have 1–7 entries; an empty/absent
-    //     array fails with constraint '1 to 7' (Array length 0 ...).
-    //   • Presets DISABLED → presetTypes MUST NOT be set at all; setting it
-    //     fails with 'Conformance "PRES": Matter does not allow you to set
-    //     this attribute'.
-    // `activePresets` is chosen by register(): the remembered value, else the
-    // DEFAULT_PRESETS_ENABLED first guess, corrected by the self-healing retry
-    // if the guess was wrong. We declare a single Occupied preset type to
-    // satisfy the 1–7 constraint without implementing preset management.
-    if (!this.activePresets) {
-      return base;
-    }
-    return {
-      ...base,
-      presetTypes: [{
+    if (this.thermostat!.presets) {
+      // Presets is forced on by older Homebridge builds (see composeThermostat)
+      // and then REQUIRES presetTypes to hold 1–7 entries; an empty or absent
+      // array fails the '1 to 7' constraint. One Occupied type satisfies that
+      // without implementing preset management. On builds where Presets is not
+      // live, setting this at all fails with 'Conformance "PRES"'.
+      cluster.presetTypes = [{
         presetScenario: Thermostat.PresetScenario?.Occupied ?? 1,
         numberOfPresets: 1,
         // presetTypeFeatures is a Matter bitmap; matter.js expects an object
         // (not a numeric 0). An empty bitmap means "no optional features".
         presetTypeFeatures: {},
-      }],
-      numberOfPresets: 1,
-    };
+      }];
+      cluster.numberOfPresets = 1;
+    }
+
+    return cluster;
   }
 
   private matterModeFromHive(mode: HiveMode): number {
@@ -443,6 +512,8 @@ export class HiveMatterPlatform {
         return SystemMode.Off;
       case 'SCHEDULE':
         // Matter has no "schedule" mode, so surface the Hive schedule as Auto.
+        // Auto is conformance AUTO — heatingCluster() declares the cooling half
+        // that keeps the AutoMode feature live, so this value stays legal.
         return SystemMode.Auto;
       default:
         return SystemMode.Heat;

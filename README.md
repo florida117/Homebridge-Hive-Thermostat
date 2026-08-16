@@ -119,7 +119,10 @@ will additionally register Matter accessories.
 
 To use it:
 
-1. Run Homebridge v2 on a supported Node.js version.
+1. Run Homebridge v2 on a supported Node.js version. **Homebridge 2.4.0 or
+   later is recommended** — it lets a plugin choose its own Matter cluster
+   features, which is how this plugin pins the thermostat to heating-only
+   behaviour. Older 2.x releases are still supported.
 2. Enable Matter in the relevant Homebridge bridge settings.
 3. Keep **Enable Matter Accessories** (`enableMatter`) turned on in this plugin.
 4. Restart Homebridge so the Matter bridge can register the Hive accessories.
