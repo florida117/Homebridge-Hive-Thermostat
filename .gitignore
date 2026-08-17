@@ -2,3 +2,8 @@ node_modules/
 dist/
 .DS_Store
 
+# Local notes about a specific Homebridge install. These capture bridge
+# usernames, ports and storage paths for a real deployment, which do not belong
+# in a public repo.
+CURRENT_SETUP.md
+
