@@ -9,17 +9,33 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
-    # Needed by the final step to create the GitHub Release.
     permissions:
+      # Needed by the final step to create the GitHub Release.
       contents: write
+      # Lets npm trade a GitHub OIDC token for a short-lived publish
+      # credential ("trusted publishing"). This replaces NPM_PUBLISH_TOKEN:
+      # there is no secret to rotate and nothing to expire mid-release, which
+      # is exactly how 1.0.6 failed — the token hit its 90-day limit between
+      # two releases. It also gets the published tarball a provenance
+      # attestation linking it back to this workflow run.
+      id-token: write
 
     steps:
       - uses: actions/checkout@v7
 
+      # `registry-url` is deliberately NOT set here. It makes setup-node write
+      # an .npmrc pinning the auth token to ${NODE_AUTH_TOKEN}, which is now
+      # unset — npm would then present an empty credential instead of falling
+      # through to OIDC. registry.npmjs.org is npm's default anyway.
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm 11.5.1 or newer, which is ahead of the npm
+      # bundled with Node 22. Pinning it makes the requirement explicit rather
+      # than resting on whatever the runner image happens to ship today.
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@^11.5.1
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -47,9 +63,7 @@ jobs:
           cat release-notes.md
 
       - name: Publish
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+        run: npm publish --access public --provenance
 
       # A tag alone does not create a GitHub Release, and the Homebridge UI
       # reads its "what's new" text from the Releases API — without this the
