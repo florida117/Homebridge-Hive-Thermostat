@@ -242,6 +242,18 @@ Everything that can reject a release runs before `npm publish`, because that
 step cannot be undone: the tag/version match, the trusted-publisher check and
 the changelog extraction all gate it.
 
+The workflow has two jobs. `build` installs dependencies, builds, runs the
+gates and packs the tarball; `publish` downloads that tarball and publishes it.
+Only `publish` holds `id-token: write`, and GitHub exposes the OIDC request
+credentials to *every* step of a job that has it — so anything running there
+can mint a real publish credential for this package. `npm publish` would
+normally run the `prepare`/`prepublishOnly` scripts, putting `rimraf` and `tsc`
+(and their dependency trees) inside that job. Publishing a finished tarball
+avoids it: npm skips lifecycle scripts for a tarball spec, so the `publish` job
+installs nothing and runs no third-party code. `npm pack --ignore-scripts` in
+`build` is what makes the tarball publishable that way, and it also means the
+project is built exactly once per release.
+
 ### Publishing credentials
 
 There are none. The workflow publishes via **npm trusted publishing (OIDC)**:
@@ -259,6 +271,15 @@ trusted publisher registered under the package's *Settings → Trusted Publisher
 | Repository | `Homebridge-Hive-Thermostat` |
 | Workflow filename | `publish.yml` |
 | Environment | *(empty)* |
+
+**Allowed actions** must include direct publishing. Trusted publishers created
+after 2026-09-03 default to permitting `npm stage publish` only, and a release
+then fails with `403 OIDC permission denied for this action` — npm trusts the
+workflow's identity but not the action it is attempting. This is separate from
+the configuration above and cannot be checked in advance: the registry API that
+exposes allowed actions requires package-write permission behind an interactive
+2FA challenge, which no CI job can satisfy. The publish step recognises that
+specific rejection and prints the fix.
 
 ⚠️ The link is bound to the **workflow filename**. Renaming `publish.yml`, or
 moving the publish into a reusable workflow, silently invalidates it. npm

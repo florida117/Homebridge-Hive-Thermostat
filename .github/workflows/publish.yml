@@ -5,8 +5,75 @@ on:
     tags:
       - 'v*'
 
+# The release is split across two jobs on purpose. Only `publish` holds
+# `id-token: write`, and GitHub exposes the OIDC request credentials to every
+# step of a job that has it — so any code running there can mint a real npm
+# publish credential for this package. `npm publish` normally runs the
+# `prepare`/`prepublishOnly` lifecycle scripts, which execute rimraf and tsc
+# from devDependencies, so a compromised dependency would run inside that
+# job. Building here and publishing a finished tarball there keeps every
+# third-party line of code in the unprivileged job: `publish` installs
+# nothing, and npm skips lifecycle scripts entirely for a tarball spec
+# (npm/lib/commands/publish.js gates them on `spec.type === 'directory'`).
 jobs:
+  # Everything that can reject the release, plus the artifact itself.
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 24, not 22, because trusted publishing needs npm >= 11.5.1 and
+      # Node 22 still bundles npm 10.9.x. Node 24 bundles 11.19 and Node 26
+      # bundles 11.19.1, so picking a supported runtime satisfies the
+      # requirement outright, without installing npm over the top of the image.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      # Everything that can reject the release runs before anything is
+      # published, because npm publish is effectively irreversible.
+      - name: Check tag matches package.json version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p 'require("./package.json").version')"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "Tag $GITHUB_REF_NAME implies version $tag_version," \
+                 "but package.json is $pkg_version." >&2
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          .github/scripts/extract-changelog.sh "${GITHUB_REF_NAME#v}" \
+            > release-notes.md
+          echo "--- release notes ---"
+          cat release-notes.md
+
+      # --ignore-scripts so `prepare` does not rebuild what the Build step just
+      # produced; this packs exactly those artifacts. It is also what makes the
+      # tarball publishable without scripts downstream.
+      - name: Pack the tarball to publish
+        run: npm pack --ignore-scripts --pack-destination pack
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: |
+            pack/*.tgz
+            release-notes.md
+          retention-days: 7
+          if-no-files-found: error
+
   publish:
+    needs: build
     runs-on: ubuntu-latest
 
     permissions:
@@ -21,56 +88,26 @@ jobs:
       id-token: write
 
     steps:
+      # Checked out for the preflight script and repo config only. Nothing is
+      # installed in this job — see the note at the top of the file.
       - uses: actions/checkout@v7
 
-      # Node 24, not 22, because trusted publishing needs npm >= 11.5.1 and
-      # Node 22 still bundles npm 10.9.x. Node 24 bundles 11.19 and Node 26
-      # bundles 11.19.1, so picking a supported runtime satisfies the
-      # requirement outright — better than installing npm globally over the
-      # top, which would resolve a different npm than the one ci.yml exercises
-      # and add a network dependency to a job holding publish authority.
-      #
       # `registry-url` is deliberately NOT set. It makes setup-node write an
       # .npmrc binding the auth token to ${NODE_AUTH_TOKEN}; with that variable
       # gone, @npmcli/config substitutes the LITERAL string `${NODE_AUTH_TOKEN}`
       # (env-replace.js only falls back to empty for the `${VAR?}` form), so npm
-      # would send that as the credential and take a 401. registry.npmjs.org is
-      # npm's default anyway.
+      # would send that as the credential and take a 401 instead of using OIDC.
+      # registry.npmjs.org is npm's default anyway.
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
 
-      - name: Build
-        run: npm run build
-
-      # Everything that can reject the release runs before the publish step,
-      # because npm publish is effectively irreversible.
-      - name: Check tag matches package.json version
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          pkg_version="$(node -p 'require("./package.json").version')"
-          if [ "$tag_version" != "$pkg_version" ]; then
-            echo "Tag $GITHUB_REF_NAME implies version $tag_version," \
-                 "but package.json is $pkg_version." >&2
-            exit 1
-          fi
-
-      # Publishing depends on state that lives on npmjs.com, not in this repo,
-      # and npm reports a mismatch as a bare "requires you to be logged in".
-      # Ask npm the same question up front, while failing is still free.
       - name: Check the npm trusted publisher is configured
         run: node .github/scripts/check-trusted-publisher.mjs
-
-      - name: Extract release notes from CHANGELOG
-        run: |
-          .github/scripts/extract-changelog.sh "${GITHUB_REF_NAME#v}" \
-            > release-notes.md
-          echo "--- release notes ---"
-          cat release-notes.md
 
       # No --provenance flag: npm enables provenance by itself on the OIDC
       # path, but only while the setting is still at its default
@@ -79,11 +116,30 @@ jobs:
       # flag makes that check false and skips those guards for no gain.
       - name: Publish
         id: publish
-        run: npm publish --access public
+        run: |
+          set -o pipefail
+          tarball="$(ls pack/*.tgz)"
+          echo "Publishing $tarball"
+          if ! npm publish "$tarball" --access public 2>&1 | tee publish.log; then
+            # The preflight proves npm trusts this workflow's identity, but the
+            # registry only reveals which ACTIONS that identity may perform at
+            # publish time — and there is no way to ask beforehand, since the
+            # trusted-publisher API needs an interactive 2FA challenge. Turn
+            # the opaque rejection into the fix.
+            if grep -q 'OIDC permission denied for this action' publish.log; then
+              echo "::error::npm trusts this workflow but will not let it run" \
+                   "'npm publish'. Trusted publishers created after 2026-09-03" \
+                   "default to allowing 'npm stage publish' only. Enable direct" \
+                   "publishing under the package's Trusted Publisher settings," \
+                   "then re-run this workflow."
+            fi
+            exit 1
+          fi
 
       # A tag alone does not create a GitHub Release, and the Homebridge UI
       # reads its "what's new" text from the Releases API — without this the
       # plugin update shows no notes.
+      #
       # This step runs even when Publish failed, because a re-run can never get
       # past Publish once the version is live — npm refuses to republish one.
       # Without that, a single transient GitHub API error would strand a

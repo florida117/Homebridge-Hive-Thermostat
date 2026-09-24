@@ -16,6 +16,17 @@
  * registry's audience, then POST it to the registry's token-exchange endpoint.
  * The exchange returns a real (short-lived) publish credential, so nothing
  * here prints the response body.
+ *
+ * ⚠️ Scope of this check: it proves npm recognises this repository and
+ * workflow as a trusted publisher for the package. It does NOT prove the
+ * publish will be allowed. Which *actions* a trusted publisher may perform
+ * (`npm stage publish` only, or direct `npm publish` too) is separate
+ * configuration, and the registry reveals it only by accepting or rejecting
+ * the publish itself: the API that exposes it requires package-write
+ * permission behind an interactive 2FA challenge, which no CI job can satisfy
+ * and the OIDC credential is not scoped for. A release can therefore pass this
+ * check and still fail with `403 OIDC permission denied for this action` —
+ * the publish step recognises that specific rejection and explains it.
  */
 
 import { readFileSync } from 'node:fs';
@@ -91,4 +102,7 @@ if (!exchange.ok) {
   );
 }
 
-console.log(`✓ npm accepts this workflow as a trusted publisher for "${name}".`);
+console.log(
+  `✓ npm recognises this workflow as a trusted publisher for "${name}".\n` +
+    '  (Whether it may publish directly is decided at publish time — see above.)',
+);
