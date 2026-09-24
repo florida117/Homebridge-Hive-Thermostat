@@ -60,8 +60,12 @@ jobs:
       # --ignore-scripts so `prepare` does not rebuild what the Build step just
       # produced; this packs exactly those artifacts. It is also what makes the
       # tarball publishable without scripts downstream.
+      # mkdir first: --pack-destination does not create the directory, and npm
+      # fails with a bare ENOENT on the .tgz path if it is missing.
       - name: Pack the tarball to publish
-        run: npm pack --ignore-scripts --pack-destination pack
+        run: |
+          mkdir -p pack
+          npm pack --ignore-scripts --pack-destination pack
 
       - uses: actions/upload-artifact@v7
         with:
