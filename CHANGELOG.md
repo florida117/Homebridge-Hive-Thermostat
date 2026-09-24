@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.7] - 2026-09-24
+
+**Maintenance release — no functional changes.** Nothing in the plugin itself
+changed since 1.0.6; your Hive devices behave identically. This release exists
+to exercise the rebuilt release pipeline, and you can safely skip it.
+
+### Changed
+- Releases are now published using npm trusted publishing (OpenID Connect)
+  rather than a long-lived access token. 1.0.6 could not be published
+  automatically because that token had reached npm's 90-day expiry, and npm
+  reports an expired credential as a 404 on the package, which reads as though
+  the package had been unpublished. There is no longer a credential to expire.
+- The release workflow now checks that npm will accept its identity *before*
+  publishing, so a misconfiguration fails while the release can still be
+  retried rather than after the version is public.
+- The GitHub Release step is now recoverable. Previously a transient API error
+  after a successful publish left a version on npm with no release notes, and
+  re-running could not fix it because npm refuses to republish a version — the
+  Homebridge UI reads its "what's new" text from those notes.
+
 ## [1.0.6] - 2026-09-24
 
 **A round of Matter correctness fixes.** If you use the Hive zones over Matter,
