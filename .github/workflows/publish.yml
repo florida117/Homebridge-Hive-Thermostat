@@ -122,7 +122,11 @@ jobs:
         id: publish
         run: |
           set -o pipefail
-          tarball="$(ls pack/*.tgz)"
+          # The ./ prefix is load-bearing: npm-package-arg parses a bare
+          # `pack/x.tgz` as the GitHub shorthand owner/repo and tries to clone
+          # it. Only ./pack/x.tgz is treated as a file spec — and a file spec
+          # is what keeps npm from running lifecycle scripts.
+          tarball="$(ls ./pack/*.tgz)"
           echo "Publishing $tarball"
           if ! npm publish "$tarball" --access public 2>&1 | tee publish.log; then
             # The preflight proves npm trusts this workflow's identity, but the
