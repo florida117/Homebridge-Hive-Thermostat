@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.8] - 2026-09-24
+
+**Maintenance release — no functional changes.** As with 1.0.7, nothing in the
+plugin itself has changed and you can safely skip this one.
+
+### Changed
+- The published package is now built and packed in a job with no publishing
+  permissions, and uploaded by a separate job that installs no dependencies at
+  all. Previously the build tooling ran inside the job able to obtain a
+  publishing credential, so a compromised build dependency could have reached
+  it. Nothing about the plugin's own code or behaviour changes.
+- The package is built once per release rather than three times, and the
+  tarball that ships is now the one the build step produced.
+
 ## [1.0.7] - 2026-09-24
 
 **Maintenance release — no functional changes.** Nothing in the plugin itself
