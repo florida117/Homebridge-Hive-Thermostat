@@ -2,6 +2,60 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.6] - 2026-09-24
+
+**A round of Matter correctness fixes.** If you use the Hive zones over Matter,
+this release stops the plugin from fighting itself: scheduled temperature
+changes no longer knock a zone off its Hive schedule, and a Matter controller
+touching the (inert) cooling controls no longer turns your heating down. Normal
+HomeKit accessories were never affected, and no configuration changes are
+needed.
+
+### Fixed
+- **A scheduled Hive temperature change could switch the zone off its
+  schedule.** Homebridge reports every thermostat attribute change to the
+  plugin that wrote it, with nothing marking it as the plugin's own — so each
+  poll that pushed a new target came straight back as though a controller had
+  asked for it, and the plugin sent it to Hive as a manual setpoint. Because a
+  manual setpoint also sets the mode, a zone following the Hive schedule could
+  be moved to MANUAL by the schedule's own temperature change. Mode changes
+  echoed the same way. The plugin now recognises its own writes.
+- **A cooling setpoint written by a Matter controller silently changed your
+  heating target.** Cooling is declared on this heating-only thermostat because
+  the Matter spec requires it for Auto mode (which carries the Hive schedule),
+  and it is pinned to the top of the range. Nothing kept it there: matter.js
+  reconciles the heating and cooling setpoints as a pair, so a controller
+  dragging the cooling handle to 18 °C pulled the *heating* setpoint down to
+  18 °C with it — and that drag was reported as an ordinary heating change, so
+  it reached Hive as a real setpoint command and turned the heating down for
+  real. The drag is now recognised for what it is, and both setpoints are
+  restored from Hive as soon as it happens.
+- **Writing a cooling setpoint, or using the SetpointRaiseLower command, failed
+  outright.** Homebridge routes both to a plugin handler and rejects the
+  operation with a generic failure when none is registered, logging an error on
+  every attempt. Both handlers now exist; SetpointRaiseLower adjusts the heating
+  target by the requested amount, clamped to the Hive range.
+- **A zone switched to manual mode while the boiler was idle reported "heating"
+  until Homebridge restarted.** matter.js forces the running mode to match a
+  changed system mode, which overwrote the real value; because the plugin
+  recorded what it had intended to write, no later poll corrected it.
+- **A Matter problem could take the plain HomeKit accessories down with it.**
+  Matter registration ran unguarded on the startup path, so an exception there
+  left the Hive poll timer unarmed and froze the non-Matter thermostat and hot
+  water accessories too.
+- **A thermostat that failed to come online stayed dead for the life of the
+  process.** Registration verification is wired back to a one-shot retry, so a
+  future Homebridge that composes the thermostat differently recovers instead of
+  logging once and giving up. Nothing is persisted — the decision is re-derived
+  on every start.
+- **Startup no longer stalls for six seconds, or reports healthy thermostats as
+  broken, on Homebridge builds that cannot read Matter state back.**
+- The advertised cooling range is now the Matter spec's own 16–32 °C instead of
+  Hive's 5–32 °C heating range. Cooling is inert either way, but a 5 °C cooling
+  floor on a boiler is a fiction some controllers validate against.
+- The `.hive-thermostat-matter.json` file written by 1.0.4 is removed on
+  startup. 1.0.5 stopped reading it and left it behind.
+
 ## [1.0.5] - 2026-08-16
 
 **If your Hive heating zones stopped appearing over Matter after updating to

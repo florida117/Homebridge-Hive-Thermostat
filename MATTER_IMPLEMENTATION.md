@@ -169,52 +169,139 @@ guesswork:
    ALL CHECKS PASSED
    ```
 
-## 5. The fix (`src/matterPlatform.ts`)
+## 5. The design (`src/matterPlatform.ts`)
 
-Static inspection of the device type turned out to be **insufficient on its
-own**: the Presets feature can be added by Homebridge's runtime thermostat
-behaviour, so a build can report `presets: false` on the device-type template
-yet still require `presetTypes` at registration (this is what happens on the
-Pi). Worse, `registerPlatformAccessories` only *emits* an event — the endpoint
-initialization (and its validation failure) happens asynchronously afterwards,
-so the failure cannot be caught with a `try/catch` around registration.
+### 5.1 Three Homebridge regimes, each detected rather than guessed
 
-The plugin uses Homebridge's full-feature Thermostat device type (so the Home
-app can show Auto, which maps to the Hive schedule), and the Presets state is
-**not deterministic** across builds — some require a non-empty `presetTypes`
-array, others reject it entirely. The fix is a **self-healing retry**:
+Static inspection of the device-type template was misleading on its own, and so
+was a fixed default: what matters is how the *live* endpoint ends up composed,
+and that differs by Homebridge generation. `composeThermostat()` identifies the
+regime from an observable property, never a version string:
 
-1. **Default the first guess to enabled** (`DEFAULT_PRESETS_ENABLED = true`),
-   matching current Homebridge 2.x runtime thermostats, which require a
-   non-empty `presetTypes`. We deliberately do *not* read the device-type
-   template's feature flags — they proved misleading (a template can report
-   `presets: false` yet the live endpoint still requires `presetTypes`). A build
-   that instead rejects `presetTypes` self-heals via the retry below.
-2. **Self-healing registration** (`register()` → `registerWith()` +
-   `verifyThermostats()`): register with the guess, then poll
-   `getAccessoryState(uuid, 'thermostat')` for each zone. A thermostat whose
-   endpoint failed validation never enters the live accessory map, so its state
-   read stays `undefined`. If any thermostat doesn't come online within a short
-   window, flip the Presets decision, re-register once, and verify again. This
-   makes the plugin converge on the correct setting regardless of how (or
-   whether) the feature can be detected.
-2a. **Remembering the decision**: the value that successfully registered is
-   persisted to `.hive-thermostat-matter.json` in the Homebridge storage path
-   (`loadPersistedPresets()` / `savePersistedPresets()`). On subsequent
-   restarts that remembered value is used as the initial guess, so even on a
-   build that needs the non-default setting the failed first attempt (and its
-   `Behaviors have errors` stack trace) only ever happens once. The self-healing
-   retry remains the fallback, and it re-persists if the platform ever changes
-   its requirement.
-3. The preset entry, when included, uses the correct three-field struct
-   (`presetScenario` / `numberOfPresets` / `presetTypeFeatures`) with
-   `presetTypeFeatures: {}` (empty bitmap) — not the invalid numeric `0` or the
-   non-existent `appliesToHvac` field.
-4. **Trimmed `updateHeating`** to push only the runtime-mutable attributes:
-   `localTemperature`, `occupiedHeatingSetpoint`, `systemMode`,
-   `thermostatRunningMode`.
+| Regime | Detected by | Cluster features live | `presetTypes` |
+| --- | --- | --- | --- |
+| Homebridge >= 2.4.0 | `api.matter.deviceRequirements` exists | composed by the plugin: Heating, Cooling, AutoMode | must be absent |
+| Homebridge 2.3.x | bare `deviceTypes.Thermostat` | detected from the declared setpoints: Heating, Cooling, AutoMode | must be absent |
+| Homebridge <= 2.2.x | `deviceTypes.Thermostat.behaviors.thermostat` is already set | matter.js `ThermostatServer` defaults: Heating, Cooling, Occupancy, AutoMode, **Presets** | must hold 1–7 entries |
 
-`npm run build` passes.
+On 2.3.x there is no way to override the detected features, and none is needed:
+`detectThermostatFeatures()` reads the declared setpoints, so declaring a
+cooling setpoint alongside the heating one yields exactly the set the plugin
+composes explicitly on 2.4.0.
+
+### 5.2 The cooling half, and why it cannot be dropped
+
+Hive only heats, but the Matter spec conforms HEAT and COOL as `"AUTO, O.a+"` —
+AutoMode requires **both**. AutoMode is what carries the Hive schedule (Matter
+has no schedule mode), so the cooling half is declared everywhere:
+
+- `occupiedCoolingSetpoint` is pinned to the top of the range, and
+  `controlSequenceOfOperation` is `HeatingOnly`, so cooling stays inert.
+- The cooling **limits** use the spec's own 16–32 °C `AbsMin/MaxCoolSetpointLimit`
+  range rather than Hive's 5–32 °C heating range. matter.js does not enforce it
+  (`constraint: "desc"`), but a stricter controller may, and a 5 °C cooling floor
+  on a boiler is a fiction with no upside.
+- ⚠️ `minSetpointDeadBand: 0` is mandatory. AutoMode brings the deadband, and
+  matter.js >= 0.17.7 validates the whole cluster:
+  `max/minCoolSetpointLimit - max/minHeatSetpointLimit >= minSetpointDeadBand`.
+  An undeclared deadband defaults to 2.0 °C, which against a 32 °C top on both
+  sides gives `3200 - 3200 = 0` and fails. The symptom is badly disconnected
+  from the cause: registration succeeds, then *every* later setpoint update is
+  rejected with "Thermostat setpoints could not be reconciled within the
+  configured limits".
+
+`occupancy` is deliberately **not** declared. Where the feature is not composed
+it is rejected outright (`Conformance "OCC"`), and where it *is* composed
+(<= 2.2.x) matter.js initialises it to `{ occupied: true }` itself when the node
+comes online, so every setpoint still routes through the Occupied attributes.
+
+### 5.3 Handlers
+
+Homebridge's `HomebridgeThermostatServer` routes four thermostat operations to
+plugin handlers, and `BehaviorRegistry.executeHandler()` **throws** when one is
+missing — an unregistered handler is a hard `Status.Failure` to the controller,
+not a silent no-op. All four are registered:
+
+- `systemModeChange` → Hive mode (Off / schedule / manual).
+- `occupiedHeatingSetpointChange` → `setHeatingTarget`.
+- `occupiedCoolingSetpointChange` → repairs the endpoint. Cooling is live on
+  every generation, so a controller can write this setpoint, and matter.js then
+  reconciles the pair and drags the **heating** setpoint down with it (see 5.4).
+- `setpointRaiseLower` → applies the delta (0.1 °C steps) to the heating target,
+  clamped to the Hive range. A Cool-only adjustment is left alone here:
+  Homebridge runs matter.js's own implementation after the handler returns, so
+  the cooling setpoint it moves is repaired by the handler above.
+
+### 5.4 ⚠️ Homebridge hands the plugin its own writes back
+
+There is no local-actor guard anywhere in the chain: `HomebridgeThermostatServer`
+reacts to attribute *changes*, and matter.js does not distinguish a write made
+by the plugin (`updateAccessoryState` → `endpoint.set()`) from one made by a
+controller. Every value a poll pushes therefore arrives back at this plugin's
+own handlers, which would forward it to Hive as a user request — and
+`setHeatingTarget()` sends `mode: MANUAL`, so a temperature change made *by the
+Hive schedule* would echo back and switch the zone off that schedule.
+
+The plugin records each value it is about to write (`expectEcho()`) and
+consumes the matching callback (`isEcho()`). A second guard covers the deadband
+drag: writing the cooling setpoint makes matter.js move the heating setpoint
+inside the same transaction, reported as an ordinary heating change. The
+originating attribute commits first, so `occupiedCoolingSetpointChange` always
+runs before the heating change it causes and can mark it as collateral
+(`reconcilingSetpoints`), dropping the marker on the next tick.
+
+Both guards fail safe: the worst case is a redundant command to Hive that is
+skipped, never a wrong one that is sent.
+
+### 5.5 `updateHeating()` writes systemMode separately
+
+matter.js reacts to a `systemMode` change by forcing `thermostatRunningMode` to
+match it (`ThermostatServer#handleSystemModeChange`), and that reaction has
+already run by the time the write resolves. Sending both in one payload loses
+the running mode *permanently*, because the change-detection cache records the
+payload that was intended rather than what the endpoint kept — a zone switched
+to MANUAL with the boiler idle would report "heating" until the next restart.
+
+So the mode goes in its own write first, and when it actually lands the cache
+entry for the rest of the payload is dropped, forcing the corrective write even
+though it is byte-identical to the previous poll's.
+
+### 5.6 Registration is verified, and a wrong decision self-heals
+
+`registerPlatformAccessories` only *emits* an event — endpoint initialization
+(and its validation failure) happens asynchronously afterwards, so a failure
+cannot be caught with a `try/catch` around registration. `verifyThermostats()`
+polls `getAccessoryState(uuid, 'thermostat')` instead: a thermostat whose
+endpoint failed validation never enters the live accessory map, so its state
+read never succeeds. (Where that method does not exist there is nothing to
+observe, and verification is skipped rather than burning the deadline.)
+
+The feature set is derived rather than guessed, so this normally just confirms
+a healthy start in ~100 ms. It is still wired to a **one-shot retry**: the one
+thing the derivation cannot cover is a Homebridge generation that does not exist
+yet. If the Presets decision were wrong, matter.js would reject the endpoint and
+that thermostat would stay unreadable for the life of the process; flipping the
+one derived bit and re-registering turns a dead accessory back into a working
+one. Unlike the 1.0.4 design, nothing is persisted — the decision is re-derived
+every start, so there is no stale file and no remembered wrong answer.
+
+Matter registration is also wrapped at its call site in `platform.ts`: it is the
+last thing `discoverDevices()` does, so an exception there would otherwise leave
+the poll timer unarmed and cost the user their plain HomeKit accessories over a
+Matter-only problem.
+
+### 5.7 Verifying changes locally
+
+Conformance failures surface as a whole endpoint silently failing to come
+online, so they are easy to ship. Prove a change instead of reasoning about it:
+build a `ServerNode` from `@matter/main`, compose the device type the way
+`AccessoryManager` does, add an `Endpoint` carrying the plugin's declared
+cluster state, and see whether it initialises. `checkThermostatSetpointLimits()`
+and `detectThermostatFeatures()` from `homebridge/dist/matter/serverHelpers.js`
+are plain exported functions and can be run directly against the accessory the
+plugin produces. Drive it from an `.mjs` script (`homebridge` is ESM, the plugin
+compiles to CJS — use `createRequire` for `dist/`), give each `ServerNode` a
+unique id and its own port, and clean up `~/.matter/<id>` afterwards.
 
 ## 6. Verifying on the Raspberry Pi
 
@@ -234,12 +321,13 @@ sudo hb-service restart
 Then confirm:
 
 1. The Hive child bridge starts and Matter comes up on its configured port.
-2. On current Homebridge 2.x the thermostats register on the first attempt
-   (default Presets = enabled), with no `Behaviors have errors`.
-3. On a build that needs the opposite setting you'll see a single
-   `… did not register with Presets=…; retrying with Presets=…` warning followed
-   by `… registered after retry …` — that is the self-healing working, and it
-   happens at most once because the result is remembered.
+2. The startup line `Hive: Matter thermostat — <regime> (Presets=<bool>)` names
+   the regime that was detected, and the thermostats register on the first
+   attempt with no `Behaviors have errors`.
+3. A `… did not come online with Presets=…; Retrying once …` warning followed by
+   `… online with Presets=…` means the derivation met a Homebridge generation it
+   does not know about and recovered. That is worth a bug report, with the
+   Homebridge version — the retry is a safety net, not the intended path.
 4. The Hive accessories register **without** a final `Behaviors have errors` or
    `identify is not a Behavior.Type`.
 5. Pair the bridge in Apple Home and change a thermostat target / toggle hot

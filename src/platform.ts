@@ -32,7 +32,8 @@ import {
   MIN_POLL_INTERVAL_MS,
 } from './settings';
 import { HiveAuth, HiveSmsRequired, HiveTokens } from './hiveAuth';
-import { HiveApi, HiveNotReadyError, HiveState, TokenExpiredError } from './hiveApi';
+import { HiveApi, HiveState, TokenExpiredError } from './hiveApi';
+import { HiveNotReadyError } from './errors';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
 import { HiveMatterPlatform } from './matterPlatform';
@@ -58,6 +59,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private tokens?: HiveTokens;
 
   private readonly tokenStorePath: string;
+  private readonly legacyPresetsStorePath: string;
   private pollTimer?: NodeJS.Timeout;
   /** True while a poll is in flight, so cycles cannot overlap. */
   private polling = false;
@@ -111,6 +113,15 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       '.hive-thermostat-tokens.json',
     );
 
+    // 1.0.4 persisted the guessed Matter Presets flag here. 1.0.5 derives it
+    // instead (see composeThermostat) and never reads the file again, so every
+    // install upgraded from 1.0.4 would otherwise keep a stale dotfile forever
+    // with nothing left to explain what it was.
+    this.legacyPresetsStorePath = path.join(
+      this.homebridgeApi.user.storagePath(),
+      '.hive-thermostat-matter.json',
+    );
+
     if (!this.cfg.username || !this.cfg.password) {
       this.log.error(
         'Hive username and password are required. Set them in the plugin config.',
@@ -148,6 +159,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   // ---- Auth bootstrap ------------------------------------------------------
 
   private async bootstrap(): Promise<void> {
+    await fs.unlink(this.legacyPresetsStorePath).catch(() => {
+      /* never existed, or already gone — either way there is nothing to do */
+    });
+
     this.auth = new HiveAuth(this.cfg.username!, this.cfg.password!, this.log);
 
     // 1. Try a stored refresh token first — the happy path on every restart.
@@ -293,7 +308,22 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
     // Seed initial values.
     this.applyState(state);
-    await this.matterPlatform?.register(state);
+
+    // Matter registration is the last thing discoverDevices() does, and
+    // bootstrap() only reaches startPolling() once it resolves — so an
+    // exception here (a matter.js conformance rejection, a device-type shape
+    // this Homebridge does not offer) would be swallowed by bootstrap()'s
+    // catch and leave the poll timer unarmed, costing the user their plain
+    // HomeKit thermostat and hot water accessories over a Matter-only problem.
+    try {
+      await this.matterPlatform?.register(state);
+    } catch (err) {
+      this.log.error(
+        `Hive: Matter registration failed (${(err as Error).message}). ` +
+          'HomeKit accessories are unaffected; please open a GitHub issue with ' +
+          'your Homebridge version.',
+      );
+    }
   }
 
   private registerHeating(id: string, name: string): void {
