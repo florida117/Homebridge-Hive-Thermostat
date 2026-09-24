@@ -225,6 +225,48 @@ npm run lint
 
 There are currently no automated tests defined in `package.json`.
 
+## Releasing
+
+A release is cut by pushing a `v*` tag; `.github/workflows/publish.yml` does the
+rest. Before tagging:
+
+1. Bump `version` in `package.json` (`npm version <v> --no-git-tag-version`,
+   which updates `package-lock.json` too).
+2. Add a `## [<version>] - <date>` section to `CHANGELOG.md`. The workflow
+   extracts it with `.github/scripts/extract-changelog.sh` and uses it as the
+   GitHub Release body — which is where the Homebridge UI reads its "what's
+   new" text from, so it is user-facing.
+3. Commit, then push the commit *and* the tag.
+
+Everything that can reject a release runs before `npm publish`, because that
+step cannot be undone: the tag/version match, the trusted-publisher check and
+the changelog extraction all gate it.
+
+### Publishing credentials
+
+There are none. The workflow publishes via **npm trusted publishing (OIDC)**:
+npm mints a short-lived credential from GitHub's identity for each run, so
+there is no token in the repository secrets to rotate or expire. (The previous
+`NPM_PUBLISH_TOKEN` expired at npm's 90-day limit between 1.0.5 and 1.0.6 and
+broke that release.)
+
+This depends on state held on npmjs.com rather than in this repository — a
+trusted publisher registered under the package's *Settings → Trusted Publisher*:
+
+| Field | Value |
+| --- | --- |
+| Organization or user | `florida117` |
+| Repository | `Homebridge-Hive-Thermostat` |
+| Workflow filename | `publish.yml` |
+| Environment | *(empty)* |
+
+⚠️ The link is bound to the **workflow filename**. Renaming `publish.yml`, or
+moving the publish into a reusable workflow, silently invalidates it. npm
+reports a mismatch only as `ENEEDAUTH: This command requires you to be logged
+in`, with the real reason logged at `verbose` and discarded — which is why
+`.github/scripts/check-trusted-publisher.mjs` performs the same token exchange
+up front and prints what npm actually said.
+
 ## Important implementation details
 
 - The plugin depends on Hive cloud access. It does not work locally against a Hive hub.

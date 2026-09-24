@@ -23,19 +23,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # `registry-url` is deliberately NOT set here. It makes setup-node write
-      # an .npmrc pinning the auth token to ${NODE_AUTH_TOKEN}, which is now
-      # unset — npm would then present an empty credential instead of falling
-      # through to OIDC. registry.npmjs.org is npm's default anyway.
+      # Node 24, not 22, because trusted publishing needs npm >= 11.5.1 and
+      # Node 22 still bundles npm 10.9.x. Node 24 bundles 11.19 and Node 26
+      # bundles 11.19.1, so picking a supported runtime satisfies the
+      # requirement outright — better than installing npm globally over the
+      # top, which would resolve a different npm than the one ci.yml exercises
+      # and add a network dependency to a job holding publish authority.
+      #
+      # `registry-url` is deliberately NOT set. It makes setup-node write an
+      # .npmrc binding the auth token to ${NODE_AUTH_TOKEN}; with that variable
+      # gone, @npmcli/config substitutes the LITERAL string `${NODE_AUTH_TOKEN}`
+      # (env-replace.js only falls back to empty for the `${VAR?}` form), so npm
+      # would send that as the credential and take a 401. registry.npmjs.org is
+      # npm's default anyway.
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
-
-      # Trusted publishing needs npm 11.5.1 or newer, which is ahead of the npm
-      # bundled with Node 22. Pinning it makes the requirement explicit rather
-      # than resting on whatever the runner image happens to ship today.
-      - name: Use an npm that supports trusted publishing
-        run: npm install -g npm@^11.5.1
+          node-version: '24'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
@@ -55,6 +59,12 @@ jobs:
             exit 1
           fi
 
+      # Publishing depends on state that lives on npmjs.com, not in this repo,
+      # and npm reports a mismatch as a bare "requires you to be logged in".
+      # Ask npm the same question up front, while failing is still free.
+      - name: Check the npm trusted publisher is configured
+        run: node .github/scripts/check-trusted-publisher.mjs
+
       - name: Extract release notes from CHANGELOG
         run: |
           .github/scripts/extract-changelog.sh "${GITHUB_REF_NAME#v}" \
@@ -62,17 +72,49 @@ jobs:
           echo "--- release notes ---"
           cat release-notes.md
 
+      # No --provenance flag: npm enables provenance by itself on the OIDC
+      # path, but only while the setting is still at its default
+      # (oidc.js checks `config.isDefault('provenance')`), and only after
+      # confirming both the repository and the package are public. Passing the
+      # flag makes that check false and skips those guards for no gain.
       - name: Publish
-        run: npm publish --access public --provenance
+        id: publish
+        run: npm publish --access public
 
       # A tag alone does not create a GitHub Release, and the Homebridge UI
       # reads its "what's new" text from the Releases API — without this the
       # plugin update shows no notes.
+      # This step runs even when Publish failed, because a re-run can never get
+      # past Publish once the version is live — npm refuses to republish one.
+      # Without that, a single transient GitHub API error would strand a
+      # published version with no notes and no way to fix it by re-running.
+      #
+      # It must not announce a version that never shipped, though, so when
+      # Publish did not succeed it first confirms the version is actually on
+      # the registry. That check is deliberately skipped on the happy path:
+      # npm's publish pipeline is asynchronous and a freshly published version
+      # can take a minute to become visible, so asking the registry here would
+      # race it. The publish step's own success is the better evidence.
       - name: Create GitHub Release
+        if: always()
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${{ steps.publish.outcome }}" != "success" ]; then
+            name="$(node -p 'require("./package.json").name')"
+            if ! npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "${name}@${version} is not on the registry, so there is" \
+                   "nothing to announce. Skipping the GitHub Release."
+              exit 0
+            fi
+            echo "${name}@${version} is already published — creating the" \
+                 "Release that the earlier run did not."
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
-            --verify-tag
+            --verify-tag \
+          || gh release edit "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
