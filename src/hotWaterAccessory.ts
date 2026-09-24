@@ -67,7 +67,7 @@ export class HiveHotWaterAccessory {
 
   private async setOn(value: CharacteristicValue): Promise<void> {
     if (value) {
-      await this.platform.hive.setHotWaterBoost(this.hiveId, this.boostMinutes);
+      await this.platform.setHotWaterBoost(this.hiveId, this.boostMinutes);
       if (this.latest) {
         this.latest.boosting = true;
       }
@@ -76,7 +76,7 @@ export class HiveHotWaterAccessory {
       );
     } else {
       const prev = this.latest?.previousMode ?? 'SCHEDULE';
-      await this.platform.hive.cancelHotWaterBoost(this.hiveId, prev);
+      await this.platform.cancelHotWaterBoost(this.hiveId, prev);
       if (this.latest) {
         this.latest.boosting = false;
       }

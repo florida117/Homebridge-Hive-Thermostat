@@ -154,7 +154,7 @@ export class HiveHeatingAccessory {
       default:
         mode = 'MANUAL';
     }
-    await this.platform.hive.setHeatingMode(this.hiveId, mode);
+    await this.platform.setHeatingMode(this.hiveId, mode);
     if (this.latest) {
       this.latest.mode = mode;
     }
@@ -162,7 +162,7 @@ export class HiveHeatingAccessory {
   }
 
   private async setTargetTemp(value: CharacteristicValue): Promise<void> {
-    await this.platform.hive.setHeatingTarget(this.hiveId, value as number);
+    await this.platform.setHeatingTarget(this.hiveId, value as number);
     if (this.latest) {
       this.latest.targetTemperature = value as number;
       this.latest.mode = 'MANUAL';

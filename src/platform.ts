@@ -32,7 +32,7 @@ import {
   MIN_POLL_INTERVAL_MS,
 } from './settings';
 import { HiveAuth, HiveSmsRequired, HiveTokens } from './hiveAuth';
-import { HiveApi, HiveState, TokenExpiredError } from './hiveApi';
+import { HiveApi, HiveMode, HiveState, TokenExpiredError } from './hiveApi';
 import { HiveNotReadyError } from './errors';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
@@ -63,6 +63,17 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private pollTimer?: NodeJS.Timeout;
   /** True while a poll is in flight, so cycles cannot overlap. */
   private polling = false;
+  /**
+   * True once discovery has registered accessories. Discovery is the only
+   * thing that wires Hive product ids to handlers, so until it succeeds a poll
+   * has nowhere to deliver state.
+   */
+  private discovered = false;
+  /**
+   * Whether the standing token-refresh failure has already been reported, so a
+   * permanently rejected refresh token does not log an error every poll.
+   */
+  private authFailureReported = false;
   private readonly pollIntervalMs: number;
   private readonly hotWaterBoostMinutes: number;
   private readonly matterPlatform?: HiveMatterPlatform;
@@ -97,12 +108,12 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         this.homebridgeApi,
         this.log,
         {
-          setHeatingMode: (id, mode) => this.hive.setHeatingMode(id, mode),
-          setHeatingTarget: (id, temp) => this.hive.setHeatingTarget(id, temp),
-          setHotWaterBoost: (id, minutes) => this.hive.setHotWaterBoost(id, minutes),
+          setHeatingMode: (id, mode) => this.setHeatingMode(id, mode),
+          setHeatingTarget: (id, temp) => this.setHeatingTarget(id, temp),
+          setHotWaterBoost: (id, minutes) => this.setHotWaterBoost(id, minutes),
           cancelHotWaterBoost: (id, previousMode) =>
-            this.hive.cancelHotWaterBoost(id, previousMode),
-          pollSoon: () => this.pollSoon(),
+            this.cancelHotWaterBoost(id, previousMode),
+          pollSoon: (delayMs) => this.pollSoon(delayMs),
         },
         this.hotWaterBoostMinutes,
       );
@@ -256,9 +267,16 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private async discoverDevices(): Promise<void> {
     let state: HiveState;
     try {
-      state = await this.api!.getState();
+      state = await this.fetchState();
     } catch (err) {
-      this.log.error(`Hive: failed to fetch devices: ${(err as Error).message}`);
+      // Leaves `discovered` false so the next poll tries again. A single bad
+      // response at startup — a timeout, a Hive 5xx — used to leave the plugin
+      // permanently inert: no handlers are registered, so every later poll had
+      // nowhere to deliver state and nothing ever retried.
+      this.log.error(
+        `Hive: failed to fetch devices: ${(err as Error).message}. ` +
+          'Retrying on the next poll.',
+      );
       return;
     }
 
@@ -324,6 +342,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
           'your Homebridge version.',
       );
     }
+
+    this.discovered = true;
   }
 
   private registerHeating(id: string, name: string): void {
@@ -378,23 +398,74 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
     this.polling = true;
     try {
-      this.applyState(await this.api!.getState());
-    } catch (err) {
-      if (err instanceof TokenExpiredError) {
-        // Refresh and retry immediately rather than serving stale state until
-        // the next tick.
-        await this.refreshTokens();
-        try {
-          this.applyState(await this.api!.getState());
-        } catch (retryErr) {
-          this.log.debug(`Hive poll retry failed: ${(retryErr as Error).message}`);
-        }
-      } else {
-        this.log.debug(`Hive poll error: ${(err as Error).message}`);
+      if (!this.discovered) {
+        // Startup discovery never completed. Retry it here rather than polling
+        // into a handler map that is still empty.
+        await this.discoverDevices();
+        return;
       }
+      this.applyState(await this.fetchState());
+    } catch (err) {
+      this.log.debug(`Hive poll error: ${(err as Error).message}`);
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * Read Hive state, refreshing the session and retrying once if the token has
+   * expired, rather than serving stale state until the next tick.
+   */
+  private async fetchState(): Promise<HiveState> {
+    try {
+      return await this.api!.getState();
+    } catch (err) {
+      if (!(err instanceof TokenExpiredError) || !(await this.refreshTokens())) {
+        throw err;
+      }
+      return this.api!.getState();
+    }
+  }
+
+  /**
+   * Run a control command, refreshing the session and retrying once if the
+   * token has expired.
+   *
+   * Reads have always recovered from an expired token; writes did not, so a
+   * command that happened to land after the Cognito id token aged out failed
+   * in the user's hand and was lost — even though the very next poll would
+   * silently repair the session.
+   */
+  private async command<T>(run: (api: HiveApi) => Promise<T>): Promise<T> {
+    try {
+      return await run(this.hive);
+    } catch (err) {
+      if (!(err instanceof TokenExpiredError) || !(await this.refreshTokens())) {
+        throw err;
+      }
+      return run(this.hive);
+    }
+  }
+
+  // ---- Control commands ----------------------------------------------------
+  //
+  // Accessories and the Matter layer go through these rather than `hive`
+  // directly, so every write gets the same expired-token recovery.
+
+  setHeatingMode(id: string, mode: HiveMode): Promise<void> {
+    return this.command((api) => api.setHeatingMode(id, mode));
+  }
+
+  setHeatingTarget(id: string, temp: number): Promise<void> {
+    return this.command((api) => api.setHeatingTarget(id, temp));
+  }
+
+  setHotWaterBoost(id: string, minutes: number): Promise<void> {
+    return this.command((api) => api.setHotWaterBoost(id, minutes));
+  }
+
+  cancelHotWaterBoost(id: string, previousMode?: HiveMode): Promise<void> {
+    return this.command((api) => api.cancelHotWaterBoost(id, previousMode));
   }
 
   /**
@@ -441,21 +512,36 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  /** Refresh id/access tokens using the stored refresh token. */
-  async refreshTokens(): Promise<void> {
+  /**
+   * Refresh id/access tokens using the stored refresh token. Returns whether
+   * the session is now usable, so callers can skip a retry that would only
+   * repeat the same failure.
+   */
+  async refreshTokens(): Promise<boolean> {
     if (!this.auth || !this.tokens) {
-      return;
+      return false;
     }
     try {
       this.tokens = await this.auth.refreshFromToken(this.tokens.refreshToken);
       await this.saveRefreshToken(this.tokens.refreshToken);
+      this.authFailureReported = false;
       this.log.debug('Hive: tokens refreshed.');
+      return true;
     } catch (err) {
-      this.log.error(
+      const message =
         'Hive: token refresh failed. Re-authentication needed — ' +
-          're-enter credentials and an SMS code in the config. ' +
-          `(${(err as Error).message})`,
-      );
+        're-enter credentials and an SMS code in the config. ' +
+        `(${(err as Error).message})`;
+      // A rejected refresh token stays rejected, and polling continues in case
+      // the failure was transient — so report it once at error level and keep
+      // the rest at debug rather than filling the log every 15 seconds.
+      if (this.authFailureReported) {
+        this.log.debug(message);
+      } else {
+        this.authFailureReported = true;
+        this.log.error(message);
+      }
+      return false;
     }
   }
 

@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.9] - 2026-09-24
+
+**Reliability fixes from a full review of the plugin.** Three of these could
+leave the plugin stuck until you restarted Homebridge.
+
+### Fixed
+- **A single failed request at startup could leave the plugin permanently
+  inert.** Device discovery is the only thing that connects your Hive devices
+  to their HomeKit accessories, and if that first request failed — a timeout, a
+  Hive outage, a moment of bad Wi-Fi — nothing ever retried it. Polling carried
+  on against a device list that was never built, so temperatures never updated
+  and controls did nothing until Homebridge was restarted. Discovery is now
+  retried on the next poll.
+- **Commands could fail when your Hive session expired, even though the plugin
+  knew how to fix it.** Reads already recovered from an expired session by
+  refreshing and retrying; writes did not. A temperature or mode change that
+  happened to land just after the session aged out failed in your hand and was
+  lost, despite the very next poll silently repairing the session. Commands
+  from both HomeKit and Matter now recover the same way reads do.
+- **A rejected login filled the Homebridge log with the same error forever.**
+  When a stored session is revoked, every poll produced another identical error
+  — four a minute, indefinitely. It is now reported once, with the rest at
+  debug level, and reported again if the situation changes.
+
 ## [1.0.8] - 2026-09-24
 
 **Maintenance release — no functional changes.** As with 1.0.7, nothing in the

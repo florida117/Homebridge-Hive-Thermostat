@@ -43,6 +43,11 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 8. If Homebridge Matter is enabled and plugin Matter support is not disabled, it registers corresponding Matter accessories.
 9. It starts polling Hive periodically and pushes fresh state into HomeKit and Matter.
 
+If step 6 fails — a timeout, a Hive outage, an expired session — discovery is
+left incomplete and retried on the next poll, because nothing else wires Hive
+product ids to accessory handlers: without it every later poll would have
+nowhere to deliver state.
+
 On Homebridge shutdown, the platform clears its interval and one-shot timers.
 
 ## Authentication
@@ -181,6 +186,15 @@ If a Hive product has disappeared, the platform unregisters the stale Homebridge
 The default poll interval is 15 seconds. The configured minimum is also 15 seconds, so user config cannot poll Hive more aggressively than that. The Homebridge schema allows up to 300 seconds.
 
 After HomeKit sends a command, the plugin schedules a one-off poll about 4 seconds later. Repeated quick commands collapse into a single follow-up poll. This lets HomeKit reflect the confirmed Hive state without waiting for the next regular polling interval.
+
+Both reads and commands recover from an expired Cognito session: a 401 raises
+`TokenExpiredError`, the platform refreshes the tokens once and replays the
+request. Commands run through the platform's own `setHeatingMode` /
+`setHeatingTarget` / `setHotWaterBoost` / `cancelHotWaterBoost` wrappers rather
+than touching `HiveApi` directly, so HomeKit and Matter share that recovery.
+A refresh token that is rejected outright is reported once at error level and
+thereafter at debug, since polling continues and the failure is permanent until
+the user re-authenticates.
 
 ## Configuration
 
