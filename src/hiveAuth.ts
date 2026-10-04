@@ -15,8 +15,8 @@ import {
   CognitoRefreshToken,
 } from 'amazon-cognito-identity-js';
 import type { Logger } from 'homebridge';
-import { HIVE_URLS } from './settings';
-import { fetchWithTimeout } from './fetchWithTimeout';
+import { HIVE_URLS, HIVE_USER_AGENT } from './settings';
+import { fetchWithTimeout, withTimeout } from './timeout';
 
 export interface HiveTokens {
   idToken: string;
@@ -35,6 +35,50 @@ export class HiveSmsRequired extends Error {
     super('Hive login requires an SMS 2FA code.');
     this.name = 'HiveSmsRequired';
   }
+}
+
+/**
+ * Thrown when Hive wants something only the account owner can do — set a new
+ * password, set up MFA — so retrying without them changes nothing.
+ */
+export class HiveAuthActionRequired extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HiveAuthActionRequired';
+  }
+}
+
+/**
+ * The Cognito error codes that mean the service never gave a real answer.
+ * Every other `…Exception` is a verdict on the account or the token, and
+ * retrying it achieves nothing — or, for a wrong password, counts towards
+ * Cognito's lockout.
+ */
+const TRANSIENT_COGNITO_CODES = new Set([
+  'InternalErrorException',
+  'ServiceUnavailableException',
+  'ThrottlingException',
+  'TooManyRequestsException',
+]);
+
+/**
+ * Whether an authentication failure says nothing about the credentials — a
+ * network failure, a timeout, a Cognito outage — so the same call is worth
+ * repeating later.
+ *
+ * Cognito reports each of its own answers with an `…Exception` code. Anything
+ * without one never reached a verdict: the SSO page did not load, the request
+ * timed out, the connection dropped (`NetworkError`).
+ */
+export function isTransientAuthError(err: unknown): boolean {
+  if (err instanceof HiveSmsRequired || err instanceof HiveAuthActionRequired) {
+    return false;
+  }
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === 'string' && code.endsWith('Exception')) {
+    return TRANSIENT_COGNITO_CODES.has(code);
+  }
+  return true;
 }
 
 export class HiveAuth {
@@ -59,12 +103,7 @@ export class HiveAuth {
     }
 
     const res = await fetchWithTimeout(HIVE_URLS.sso, {
-      headers: {
-        // Hive's edge rejects requests without a normal browser UA.
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-      },
+      headers: { 'User-Agent': HIVE_USER_AGENT },
     });
 
     if (!res.ok) {
@@ -124,7 +163,7 @@ export class HiveAuth {
       Password: this.password,
     });
 
-    const session = await new Promise<CognitoUserSession>((resolve, reject) => {
+    const session = await withTimeout(new Promise<CognitoUserSession>((resolve, reject) => {
       this.cognitoUser!.authenticateUser(authDetails, {
         onSuccess: (s) => resolve(s),
         onFailure: (err) => reject(err),
@@ -138,7 +177,7 @@ export class HiveAuth {
         // reject with something the user can act on instead.
         newPasswordRequired: () =>
           reject(
-            new Error(
+            new HiveAuthActionRequired(
               'Hive requires a new password to be set. Sign in at ' +
                 'sso.hivehome.com, complete the password change, then update ' +
                 'the plugin config.',
@@ -146,27 +185,27 @@ export class HiveAuth {
           ),
         mfaSetup: () =>
           reject(
-            new Error(
+            new HiveAuthActionRequired(
               'Hive requires two-factor authentication to be set up. Complete ' +
                 'MFA setup at sso.hivehome.com, then restart Homebridge.',
             ),
           ),
         selectMFAType: () =>
           reject(
-            new Error(
+            new HiveAuthActionRequired(
               'Hive asked which MFA method to use, which this plugin cannot ' +
                 'answer. Set SMS as the default MFA method in your Hive account.',
             ),
           ),
         customChallenge: () =>
           reject(
-            new Error(
+            new HiveAuthActionRequired(
               'Hive returned an unsupported custom login challenge. Please open ' +
                 'a GitHub issue with your Homebridge log.',
             ),
           ),
       });
-    });
+    }), 'Hive login');
 
     return this.tokensFromSession(session);
   }
@@ -180,7 +219,7 @@ export class HiveAuth {
       throw new Error('submitSms called before login.');
     }
 
-    const session = await new Promise<CognitoUserSession>((resolve, reject) => {
+    const session = await withTimeout(new Promise<CognitoUserSession>((resolve, reject) => {
       this.cognitoUser!.sendMFACode(
         code.trim(),
         {
@@ -189,7 +228,7 @@ export class HiveAuth {
         },
         'SMS_MFA',
       );
-    });
+    }), 'Hive 2FA verification');
 
     return this.tokensFromSession(session);
   }
@@ -204,7 +243,7 @@ export class HiveAuth {
 
     const token = new CognitoRefreshToken({ RefreshToken: refreshToken });
 
-    const session = await new Promise<CognitoUserSession>((resolve, reject) => {
+    const session = await withTimeout(new Promise<CognitoUserSession>((resolve, reject) => {
       this.cognitoUser!.refreshSession(token, (err, s) => {
         if (err) {
           reject(err);
@@ -212,7 +251,7 @@ export class HiveAuth {
           resolve(s);
         }
       });
-    });
+    }), 'Hive session refresh');
 
     return this.tokensFromSession(session);
   }

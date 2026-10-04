@@ -18,6 +18,8 @@ import { HiveHotWater } from './hiveApi';
 export class HiveHotWaterAccessory {
   private readonly service: Service;
   private latest?: HiveHotWater;
+  /** Set while Hive is not answering; cleared by the next update(). */
+  private unreachable = false;
 
   constructor(
     private readonly platform: HiveThermostatPlatform,
@@ -45,41 +47,55 @@ export class HiveHotWaterAccessory {
 
   update(hw: HiveHotWater): void {
     this.latest = hw;
-    const { Characteristic } = this.platform;
+    this.unreachable = false;
     if (!hw.online) {
-      this.service.updateCharacteristic(
-        Characteristic.On,
-        new Error('offline') as unknown as CharacteristicValue,
-      );
+      this.reportUnreachable();
       return;
     }
-    this.service.updateCharacteristic(Characteristic.On, hw.boosting);
+    this.service.updateCharacteristic(this.platform.Characteristic.On, hw.boosting);
+  }
+
+  /** Hive has stopped answering; see HiveThermostatPlatform.markUnreachable(). */
+  markUnreachable(): void {
+    this.unreachable = true;
+    this.reportUnreachable();
+  }
+
+  private reportUnreachable(): void {
+    this.service.updateCharacteristic(
+      this.platform.Characteristic.On,
+      this.communicationFailure(),
+    );
   }
 
   private guard<T>(fn: () => T): T {
-    if (!this.latest || !this.latest.online) {
-      throw new this.platform.homebridgeApi.hap.HapStatusError(
-        this.platform.homebridgeApi.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-      );
+    if (!this.latest || !this.latest.online || this.unreachable) {
+      throw this.communicationFailure();
     }
     return fn();
   }
 
+  private communicationFailure() {
+    const { HapStatusError, HAPStatus } = this.platform.homebridgeApi.hap;
+    return new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+  }
+
   private async setOn(value: CharacteristicValue): Promise<void> {
+    // Refuse rather than accept a write before any poll has landed — Hive may
+    // not even be signed in yet.
+    const latest = this.latest;
+    if (!latest) {
+      throw this.communicationFailure();
+    }
     if (value) {
       await this.platform.setHotWaterBoost(this.hiveId, this.boostMinutes);
-      if (this.latest) {
-        this.latest.boosting = true;
-      }
+      latest.boosting = true;
       this.platform.log.info(
         `Hot water boosted on for ${this.boostMinutes} minutes.`,
       );
     } else {
-      const prev = this.latest?.previousMode ?? 'SCHEDULE';
-      await this.platform.cancelHotWaterBoost(this.hiveId, prev);
-      if (this.latest) {
-        this.latest.boosting = false;
-      }
+      await this.platform.cancelHotWaterBoost(this.hiveId, latest.mode);
+      latest.boosting = false;
       this.platform.log.info('Hot water boost cancelled.');
     }
     this.platform.pollSoon();

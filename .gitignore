@@ -7,3 +7,6 @@ dist/
 # in a public repo.
 CURRENT_SETUP.md
 
+
+# Scratch storage for scripts/verify-matter.mjs, removed when it finishes.
+.verify-matter/

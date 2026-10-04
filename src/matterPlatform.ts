@@ -1,7 +1,6 @@
 import type { Logger, MatterAccessory, MatterAPI } from 'homebridge';
 import { HIVE_MAX_TEMP, HIVE_MIN_TEMP, PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { HiveHeatingZone, HiveHotWater, HiveMode } from './hiveApi';
-import { HiveNotReadyError } from './errors';
 
 type MatterApiHost = {
   isMatterEnabled?: () => boolean;
@@ -10,9 +9,9 @@ type MatterApiHost = {
 
 type HiveMatterCommands = {
   setHeatingMode(id: string, mode: HiveMode): Promise<void>;
-  setHeatingTarget(id: string, temp: number): Promise<void>;
+  setHeatingTarget(id: string, temp: number, current?: HiveHeatingZone): Promise<void>;
   setHotWaterBoost(id: string, minutes: number): Promise<void>;
-  cancelHotWaterBoost(id: string, previousMode?: HiveMode): Promise<void>;
+  cancelHotWaterBoost(id: string, returnTo?: HiveMode): Promise<void>;
   pollSoon(delayMs?: number): void;
 };
 
@@ -22,6 +21,15 @@ type HiveMatterContext = {
 };
 
 const CELSIUS_TO_MATTER = 100;
+
+/** Writes per attribute that may be awaiting their echo; see pendingEcho. */
+const MAX_PENDING_ECHOES = 8;
+
+/**
+ * How long to wait for registered thermostats to come online. Exported so the
+ * tests can shorten it.
+ */
+export const VERIFY_DEADLINE_MS = 6000;
 
 /**
  * The cooling range this thermostat advertises, in °C.
@@ -49,9 +57,9 @@ const COOL_MAX_TEMP = 32;
  * controlSequenceOfOperation is HeatingOnly and the cooling setpoint is pinned
  * to the top of the range (see heatingCluster()).
  *
- * Occupancy is deliberately absent. The old code declared a hardcoded
- * `occupancy: { occupied: true }`, which advertised a capability Hive does not
- * have and is rejected outright once the feature is not composed.
+ * Occupancy is deliberately absent: Hive has no occupancy sensing, and
+ * declaring `occupancy` is rejected outright wherever the feature is not
+ * composed.
  */
 const THERMOSTAT_FEATURES = ['Heating', 'Cooling', 'AutoMode'] as const;
 
@@ -90,23 +98,25 @@ export class HiveMatterPlatform {
 
   /**
    * Attribute values this plugin has written and expects to see handed back to
-   * itself, keyed `<uuid>#<attribute>`.
+   * itself, oldest first, keyed `<uuid>#<attribute>`.
    *
    * ⚠️ Homebridge's thermostat behavior reacts to attribute *changes*, not to
    * controller commands, and nothing distinguishes a write made by this plugin
    * from one made by a controller — there is no local-actor guard anywhere in
    * the chain. So every value pushed during a poll comes straight back into
    * this plugin's own handlers, which would forward it to Hive as though the
-   * user had asked for it. That is not cosmetic: setHeatingTarget() also sends
-   * `mode: MANUAL`, so a temperature change made by the Hive schedule would
-   * echo back and switch the zone off the very schedule it came from.
+   * user had asked for it: a temperature change made by the Hive schedule
+   * would return as a manual setpoint.
    *
-   * An echo is consumed when it arrives. If a write turns out to be a no-op the
-   * entry simply waits, and the worst case is that one later controller write
-   * of that exact same value is treated as an echo — which costs a redundant
-   * command to Hive, never a wrong one.
+   * An echo is consumed when it arrives. A write that does not change the
+   * endpoint produces no callback, though, so its expectation lingers — and
+   * every poll re-expects the current values. That is only safe because a
+   * genuine change discards the attribute's expectations (see isEcho()).
+   * Without that, a controller moving 20 → 21 → 20 within one poll interval
+   * would have its second write swallowed as an echo of the 20 the last poll
+   * re-asserted, and Hive would never hear it.
    */
-  private readonly pendingEcho = new Map<string, number>();
+  private readonly pendingEcho = new Map<string, number[]>();
 
   /**
    * Zones whose heating setpoint is currently being moved by matter.js's own
@@ -152,20 +162,34 @@ export class HiveMatterPlatform {
     }
 
     const matter = this.api.matter!;
+    this.thermostat = this.composeThermostat(matter);
 
-    // Unregister all previously cached accessories before re-registering.
-    // After a full Homebridge process restart the cached endpoint objects
-    // come from a different Matter.js module instance, causing
-    // "identify is not a Behavior.Type" errors when Homebridge tries to
-    // reuse them.  Clearing them forces fresh endpoint creation.
-    await this.unregisterCached(matter);
+    // Homebridge 2.3 and later restore cached endpoints into the bridge before
+    // plugins start, and adopt one when the plugin re-registers its UUID —
+    // keeping the endpoint where the shape is unchanged, rebuilding it itself
+    // where it is not. Those are left alone, unless their product has left the
+    // account: unregistering them first would throw that away and rebuild
+    // every endpoint on every restart, the churn the restore exists to avoid.
+    //
+    // Anything cached but not restored is cleared before registering, as it
+    // always was. Older Homebridge could not reuse a cached endpoint (it came
+    // from another matter.js module instance, failing with "identify is not a
+    // Behavior.Type").
+    const live = new Set([
+      ...state.zones.map((zone) => this.heatingUuid(zone.id)),
+      ...state.hotWater.map((hw) => this.hotWaterUuid(hw.id)),
+    ]);
+    const restored = await this.restoredUuids(matter);
+    await this.unregisterCached(
+      matter,
+      (uuid) => !live.has(uuid) || !restored.has(uuid),
+    );
 
-    if (state.zones.length === 0 && state.hotWater.length === 0) {
+    if (live.size === 0) {
       this.registered = true;
       return;
     }
 
-    this.thermostat = this.composeThermostat(matter);
     this.log.info(
       `Hive: Matter thermostat — ${this.thermostat.regime} ` +
         `(Presets=${this.thermostat.presets}).`,
@@ -189,8 +213,10 @@ export class HiveMatterPlatform {
           'Retrying once with the opposite setting.',
       );
       this.thermostat = { ...this.thermostat, presets: !this.thermostat.presets };
-      await this.unregisterCached(matter);
-      await this.registerWith(matter, state);
+      // Only the thermostats are rebuilt; the hot water endpoints are healthy.
+      const thermostats = new Set(state.zones.map((zone) => this.heatingUuid(zone.id)));
+      await this.unregisterCached(matter, (uuid) => thermostats.has(uuid));
+      await this.registerWith(matter, { zones: state.zones, hotWater: [] });
       if (!(await this.verifyThermostats(matter, state))) {
         this.log.error(
           'Hive: thermostat endpoint(s) did not come online. Please open a GitHub ' +
@@ -282,16 +308,31 @@ export class HiveMatterPlatform {
     this.log.info(`Hive: registered ${accessories.length} Matter accessories.`);
   }
 
-  /** Unregister and forget all currently cached accessories. */
-  private async unregisterCached(matter: MatterAPI): Promise<void> {
-    if (this.cached.size === 0) {
+  /**
+   * Unregister and forget the cached accessories `which` selects.
+   *
+   * ⚠️ Only ever pass accessories that are not live, or that will not be
+   * registered again. Unregistering is fire-and-forget — Homebridge returns
+   * before the endpoint is closed and drops it from its live map only once it
+   * has — so re-registering a live UUID straight afterwards would race the
+   * removal. register() keeps to that: a restored endpoint is either left for
+   * Homebridge to adopt or belongs to a product that has gone, and the Presets
+   * retry only rebuilds thermostats that never came online.
+   */
+  private async unregisterCached(
+    matter: MatterAPI,
+    which: (uuid: string) => boolean,
+  ): Promise<void> {
+    const previous = [...this.cached.values()].filter((accessory) => which(accessory.UUID));
+    if (previous.length === 0) {
       return;
     }
-    const previous = [...this.cached.values()];
-    this.cached.clear();
-    // Fresh endpoints are created with the cluster values passed at
-    // registration, so the change-detection baseline must not survive them.
-    this.lastWritten.clear();
+    for (const accessory of previous) {
+      this.cached.delete(accessory.UUID);
+      // A fresh endpoint starts from the cluster values passed at
+      // registration, so the change-detection baseline must not survive it.
+      this.forgetWritten(accessory.UUID);
+    }
     try {
       await matter.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, previous);
     } catch (err) {
@@ -299,6 +340,36 @@ export class HiveMatterPlatform {
         `Hive: clearing previous Matter accessories: ${(err as Error).message}`,
       );
     }
+  }
+
+  /**
+   * The cached accessories Homebridge has already restored into the bridge —
+   * the ones whose state is readable before this plugin has registered
+   * anything. Where Homebridge cannot read state back, it is assumed to
+   * restore nothing.
+   */
+  private async restoredUuids(matter: MatterAPI): Promise<Set<string>> {
+    const restored = new Set<string>();
+    if (typeof matter.getAccessoryState !== 'function') {
+      return restored;
+    }
+    for (const accessory of this.cached.values()) {
+      try {
+        if (await matter.getAccessoryState(accessory.UUID, this.stateCluster(matter, accessory))) {
+          restored.add(accessory.UUID);
+        }
+      } catch {
+        /* not restored */
+      }
+    }
+    return restored;
+  }
+
+  /** The cluster whose state shows whether `accessory` has a live endpoint. */
+  private stateCluster(matter: MatterAPI, accessory: MatterAccessory<HiveMatterContext>): string {
+    return accessory.context?.kind === 'hotwater'
+      ? matter.clusterNames.OnOff
+      : matter.clusterNames.Thermostat;
   }
 
   /**
@@ -322,7 +393,7 @@ export class HiveMatterPlatform {
       return true;
     }
     const pending = new Set(state.zones.map((z) => this.heatingUuid(z.id)));
-    const deadlineMs = Date.now() + 6000;
+    const deadlineMs = Date.now() + VERIFY_DEADLINE_MS;
     while (pending.size > 0 && Date.now() < deadlineMs) {
       for (const uuid of [...pending]) {
         try {
@@ -396,6 +467,8 @@ export class HiveMatterPlatform {
       // unrestored cooling setpoint drags the heating setpoint down with it.
       occupiedCoolingSetpoint: coolingSetpoint,
     }, 'state');
+
+    await this.writeReachable(uuid, zone.online);
   }
 
   /**
@@ -424,17 +497,47 @@ export class HiveMatterPlatform {
       return;
     }
     const matter = this.api.matter!;
-    await this.writeIfChanged(this.hotWaterUuid(hw.id), matter.clusterNames.OnOff, {
-      onOff: hw.boosting,
-    });
+    const uuid = this.hotWaterUuid(hw.id);
+    await this.writeIfChanged(uuid, matter.clusterNames.OnOff, { onOff: hw.boosting });
+    await this.writeReachable(uuid, hw.online);
+  }
+
+  /**
+   * Report every accessory as unreachable while Hive is not answering. The
+   * next update for each puts its real reachability back.
+   */
+  async markUnreachable(): Promise<void> {
+    if (!this.enabled || !this.registered) {
+      return;
+    }
+    await Promise.all([
+      ...[...this.latestHeating.keys()].map((id) => this.writeReachable(this.heatingUuid(id), false)),
+      ...[...this.latestHotWater.keys()].map((id) => this.writeReachable(this.hotWaterUuid(id), false)),
+    ]);
+  }
+
+  /**
+   * Tell controllers whether the device behind `uuid` can be reached, through
+   * the bridged-device information Homebridge composes onto every bridged
+   * endpoint — Matter's equivalent of No Response. Homebridge builds that do
+   * not name the cluster are left alone.
+   */
+  private async writeReachable(uuid: string, reachable: boolean): Promise<void> {
+    const matter = this.api.matter!;
+    const cluster = (matter.clusterNames as Partial<MatterAPI['clusterNames']>)
+      .BridgedDeviceBasicInformation;
+    if (cluster) {
+      await this.writeIfChanged(uuid, cluster, { reachable }, 'reachable');
+    }
   }
 
   /**
    * Write `state` only when it differs from the last payload written for
    * `uuid`. Hive is polled every 15s but rarely changes, so this turns most
-   * polls into no-ops instead of a Matter write per accessory per cycle. The
-   * payload is recorded only after a successful write, so a failed one is
-   * retried on the next poll.
+   * polls into no-ops instead of a Matter write per accessory per cycle. A
+   * write that throws is not recorded, so it is retried on the next poll —
+   * though Homebridge 2.4 applies the write after returning, so a failure
+   * there reaches only its own log.
    */
   private async writeIfChanged(
     uuid: string,
@@ -474,16 +577,40 @@ export class HiveMatterPlatform {
 
   /** Record a value this plugin is about to write — see {@link pendingEcho}. */
   private expectEcho(uuid: string, attribute: string, value: number): void {
-    this.pendingEcho.set(`${uuid}#${attribute}`, value);
+    const key = `${uuid}#${attribute}`;
+    const expected = this.pendingEcho.get(key) ?? [];
+    if (expected[expected.length - 1] !== value) {
+      expected.push(value);
+      // Only writes whose echo never arrives (Homebridge dropped them) could
+      // pile up here, so the oldest can safely go.
+      expected.splice(0, expected.length - MAX_PENDING_ECHOES);
+      this.pendingEcho.set(key, expected);
+    }
   }
 
-  /** True when a reported change is this plugin's own write coming back. */
+  /**
+   * True when a reported change is this plugin's own write coming back.
+   *
+   * Anything else is a controller, and discards every expectation for the
+   * attribute: once a controller has moved the endpoint, a value we wrote
+   * earlier can only come back if something moves it there again — and if a
+   * controller does that, it is a real request. The one exception is a write
+   * of ours still in flight at that instant, a one-tick window whose worst case
+   * is sending Hive the value it already has.
+   */
   private isEcho(uuid: string, attribute: string, value: number): boolean {
     const key = `${uuid}#${attribute}`;
-    if (this.pendingEcho.get(key) !== value) {
+    const expected = this.pendingEcho.get(key) ?? [];
+    const index = expected.indexOf(value);
+    if (index < 0) {
+      this.pendingEcho.delete(key);
       return false;
     }
-    this.pendingEcho.delete(key);
+    // Writes land in order, so anything expected before this one was overtaken.
+    expected.splice(0, index + 1);
+    if (expected.length === 0) {
+      this.pendingEcho.delete(key);
+    }
     return true;
   }
 
@@ -496,31 +623,6 @@ export class HiveMatterPlatform {
     this.reconcilingSetpoints.add(zoneId);
     setImmediate(() => this.reconcilingSetpoints.delete(zoneId));
     await this.restoreHeating(zoneId);
-  }
-
-  /**
-   * Run a control handler, translating "not ready yet" into a Matter status
-   * the controller can act on.
-   *
-   * Homebridge already wraps an unrecognised handler error as a generic
-   * Status.Failure, which reads to a controller as "the command was attempted
-   * and failed". A command that arrived before Hive authentication finished was
-   * never attempted, so InvalidInState is the honest answer — the controller
-   * can retry rather than surface a failure to the user. `api.matter.status` is
-   * read off the api object rather than value-imported from `homebridge`, which
-   * would break on installs that keep Homebridge in a separate node_modules
-   * tree. It is absent before Homebridge 2.3.0, hence the fallback.
-   */
-  private async command(run: () => Promise<void>): Promise<void> {
-    try {
-      await run();
-    } catch (err) {
-      const status = (this.api.matter as Partial<MatterAPI> | undefined)?.status;
-      if (err instanceof HiveNotReadyError && status) {
-        throw new status.InvalidInState(err.message);
-      }
-      throw err;
-    }
   }
 
   private heatingAccessory(zone: HiveHeatingZone): MatterAccessory<HiveMatterContext> {
@@ -542,38 +644,35 @@ export class HiveMatterPlatform {
       },
       handlers: {
         thermostat: {
-          systemModeChange: ({ systemMode }) =>
-            this.command(async () => {
-              if (this.isEcho(this.heatingUuid(zone.id), 'systemMode', systemMode)) {
-                return;
-              }
-              await this.commands.setHeatingMode(
-                zone.id,
-                this.hiveModeFromMatter(systemMode),
-              );
-              this.commands.pollSoon();
-            }),
-          occupiedHeatingSetpointChange: ({ occupiedHeatingSetpoint }) =>
-            this.command(async () => {
-              // Two ways this is not a user asking for a temperature: our own
-              // poll write coming back (see pendingEcho), and matter.js
-              // dragging the heating setpoint to keep the deadband after a
-              // cooling write (see reconcilingSetpoints). Forwarding either to
-              // Hive would change the zone's real target, and switch it to
-              // MANUAL, on its own.
-              const uuid = this.heatingUuid(zone.id);
-              if (
-                this.reconcilingSetpoints.has(zone.id) ||
-                this.isEcho(uuid, 'occupiedHeatingSetpoint', occupiedHeatingSetpoint)
-              ) {
-                return;
-              }
-              await this.commands.setHeatingTarget(
-                zone.id,
-                occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
-              );
-              this.commands.pollSoon();
-            }),
+          systemModeChange: async ({ systemMode }) => {
+            if (this.isEcho(this.heatingUuid(zone.id), 'systemMode', systemMode)) {
+              return;
+            }
+            await this.commands.setHeatingMode(zone.id, this.hiveModeFromMatter(systemMode));
+            this.commands.pollSoon();
+          },
+          occupiedHeatingSetpointChange: async ({ occupiedHeatingSetpoint }) => {
+            // Two ways this is not a user asking for a temperature: our own
+            // poll write coming back (see pendingEcho), and matter.js dragging
+            // the heating setpoint to keep the deadband after a cooling write
+            // (see reconcilingSetpoints). Forwarding either to Hive would change
+            // the zone's real target on its own. The drag is checked first so
+            // it leaves the echo expectations alone: the repair it triggered
+            // has just queued the writes those expectations are for.
+            const uuid = this.heatingUuid(zone.id);
+            if (
+              this.reconcilingSetpoints.has(zone.id) ||
+              this.isEcho(uuid, 'occupiedHeatingSetpoint', occupiedHeatingSetpoint)
+            ) {
+              return;
+            }
+            await this.commands.setHeatingTarget(
+              zone.id,
+              occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
+              this.currentZone(zone),
+            );
+            this.commands.pollSoon();
+          },
           // Hive cannot cool, but Cooling is live on every Homebridge (it is
           // what keeps AutoMode legal — see THERMOSTAT_FEATURES), so a
           // controller can write this setpoint and Homebridge routes it
@@ -584,35 +683,37 @@ export class HiveMatterPlatform {
           // dragged below the heating one takes the user's real heating target
           // down with it while Hive never hears about the change. Accept it,
           // then put both setpoints back.
-          occupiedCoolingSetpointChange: ({ occupiedCoolingSetpoint }) =>
-            this.command(async () => {
-              const uuid = this.heatingUuid(zone.id);
-              if (this.isEcho(uuid, 'occupiedCoolingSetpoint', occupiedCoolingSetpoint)) {
-                return;
-              }
-              await this.absorbCoolingWrite(zone.id);
-            }),
-          setpointRaiseLower: ({ mode, amount }) =>
-            this.command(async () => {
-              const { SetpointRaiseLowerMode } = this.api.matter!.types.Thermostat;
-              // `amount` is a delta in 0.1°C steps, and the command adjusts
-              // whichever setpoints `mode` names. A Cool-only adjustment has no
-              // Hive equivalent, so it is absorbed by the same repair path as a
-              // direct cooling write.
-              if (mode === (SetpointRaiseLowerMode?.Cool ?? 1)) {
-                // Homebridge runs matter.js's own implementation after this
-                // handler returns, so the cooling setpoint it moves is repaired
-                // by occupiedCoolingSetpointChange above, not from here.
-                return;
-              }
-              const current = this.currentZone(zone).targetTemperature;
-              const target = Math.min(
-                HIVE_MAX_TEMP,
-                Math.max(HIVE_MIN_TEMP, current + amount / 10),
-              );
-              await this.commands.setHeatingTarget(zone.id, target);
-              this.commands.pollSoon();
-            }),
+          occupiedCoolingSetpointChange: async ({ occupiedCoolingSetpoint }) => {
+            const uuid = this.heatingUuid(zone.id);
+            if (this.isEcho(uuid, 'occupiedCoolingSetpoint', occupiedCoolingSetpoint)) {
+              return;
+            }
+            await this.absorbCoolingWrite(zone.id);
+          },
+          setpointRaiseLower: async ({ mode, amount }) => {
+            const { SetpointRaiseLowerMode } = this.api.matter!.types.Thermostat;
+            // Homebridge runs matter.js's own implementation after this handler
+            // returns, and that is what moves the endpoint: a Heat adjustment
+            // then reaches Hive through occupiedHeatingSetpointChange, and a
+            // Cool one is repaired by occupiedCoolingSetpointChange. Acting on
+            // either here as well would send Hive the same change twice.
+            if (mode !== (SetpointRaiseLowerMode?.Both ?? 2)) {
+              return;
+            }
+            // Both is the exception. matter.js moves the pair together and the
+            // cooling setpoint is pinned to the top of its range, so a raise
+            // has no room and is cancelled outright, and a lower moves the
+            // cooling setpoint first, making the heating half collateral of a
+            // cooling write. Either way the heating change only reaches Hive
+            // from here. `amount` is a delta in 0.1°C steps.
+            const current = this.currentZone(zone);
+            const target = Math.min(
+              HIVE_MAX_TEMP,
+              Math.max(HIVE_MIN_TEMP, current.targetTemperature + amount / 10),
+            );
+            await this.commands.setHeatingTarget(zone.id, target, current);
+            this.commands.pollSoon();
+          },
         },
       },
     };
@@ -635,25 +736,23 @@ export class HiveMatterPlatform {
       },
       handlers: {
         onOff: {
-          on: () =>
-            this.command(async () => {
+          on: async () => {
+            await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
+            this.commands.pollSoon();
+          },
+          off: async () => {
+            await this.commands.cancelHotWaterBoost(hw.id, this.current(hw).mode);
+            this.commands.pollSoon();
+          },
+          toggle: async () => {
+            const current = this.current(hw);
+            if (current.boosting) {
+              await this.commands.cancelHotWaterBoost(hw.id, current.mode);
+            } else {
               await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
-              this.commands.pollSoon();
-            }),
-          off: () =>
-            this.command(async () => {
-              await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
-              this.commands.pollSoon();
-            }),
-          toggle: () =>
-            this.command(async () => {
-              if (this.current(hw).boosting) {
-                await this.commands.cancelHotWaterBoost(hw.id, this.previousMode(hw));
-              } else {
-                await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
-              }
-              this.commands.pollSoon();
-            }),
+            }
+            this.commands.pollSoon();
+          },
         },
       },
     };
@@ -668,10 +767,6 @@ export class HiveMatterPlatform {
   /** The same, for a heating zone. */
   private currentZone(zone: HiveHeatingZone): HiveHeatingZone {
     return this.latestHeating.get(zone.id) ?? zone;
-  }
-
-  private previousMode(hw: HiveHotWater): HiveMode {
-    return this.current(hw).previousMode;
   }
 
   private heatingCluster(zone: HiveHeatingZone) {

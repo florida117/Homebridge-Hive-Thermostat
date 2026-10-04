@@ -1,6 +1,6 @@
 # Security review and remediation
 
-Review date: 2026-06-04
+Review date: 2026-06-04 (follow-up: 2026-10-04, at the end of this document)
 
 This document records the security investigation and the fixes applied to this repository. The review covered dependency advisories, credential handling, token storage, logging, Hive network calls, and package metadata.
 
@@ -124,3 +124,20 @@ Note: this machine is currently using Node.js `v26.0.0`. `homebridge` and `hap-n
 - Run the plugin on a Homebridge-supported Node.js version, ideally Node 22 or Node 24 until Homebridge declares Node 26 support.
 - After first-time Hive SMS setup, clear `smsCode` from the Homebridge config.
 - Treat the Homebridge storage directory as sensitive because it contains the Hive refresh token.
+
+## Follow-up: 2026-10-04
+
+A later review found that the timeout fix above did not cover every network
+call, and tightened a few other things. Sections above that predate this are
+kept as the record of the original review.
+
+| Area | Change |
+| --- | --- |
+| Cognito calls without a deadline | `amazon-cognito-identity-js` makes its own requests with none, so a stalled token refresh could hold a poll open until the runtime's socket defaults gave up (about five minutes). Login, 2FA submission and refresh now go through `withTimeout()` with a 15-second deadline. |
+| `node-fetch` | Replaced by Node's built-in `fetch`, with `AbortSignal.timeout()` for the deadline. `src/fetchWithTimeout.ts` became `src/timeout.ts`. Dropping `@types/node-fetch` also removed `form-data` from the tree, so its override is gone. |
+| Refresh token bound to its account | Cognito's refresh flow does not take a username, so a stored token was honoured even after the configured account changed — the plugin quietly kept controlling the old account. The token file now records the username and is ignored on a mismatch. Files written by 1.0.9 and earlier have no username and are still accepted. |
+| Repeated sign-in attempts | Startup now retries sign-in when Hive cannot be reached, but never after Cognito rejects the credentials: repeating a wrong password counts towards Cognito's lockout. |
+| CI token permissions | Both workflows default to `contents: read`; only the `publish` job widens it. Checkouts no longer persist the token in `.git/config`. |
+| Actions in the privileged job | The `publish` job holds `id-token: write`, so its actions are pinned to commit SHAs rather than movable tags. Dependabot (or a manual bump) is needed to move them on. |
+
+`npm audit --omit=dev` reports no vulnerabilities in the runtime dependencies.
