@@ -4,7 +4,7 @@ This document explains how the Homebridge Hive Thermostat plugin is structured,
 how its Matter support works, the bug that prevented Matter from working, and
 the exact steps taken to diagnose and fix it.
 
-Last updated: 2026-06-17 (branch `codex/matter-support`).
+Last updated: 2026-10-04.
 
 ## 1. Code structure
 
@@ -22,7 +22,7 @@ both HomeKit (HAP) and — when the bridge has Matter enabled — Matter.
 | `src/heatingAccessory.ts` | HAP Thermostat service for a heating zone. |
 | `src/hotWaterAccessory.ts` | HAP service for hot water boost. |
 | `src/matterPlatform.ts` | **`HiveMatterPlatform`** — all Matter registration and state sync. |
-| `src/fetchWithTimeout.ts` | `node-fetch` wrapper with an abort timeout. |
+| `src/timeout.ts` | Deadlines for network calls: `fetchWithTimeout()` (built-in `fetch` with an abort signal) and `withTimeout()` for Cognito's calls. |
 
 ### Data flow
 
@@ -57,16 +57,16 @@ Homebridge 2.1 exposes a first-class Matter Plugin API on the `api` object
   it when the `enableMatter` config option is not `false`.
 - **Registration** (`register`): builds one `MatterAccessory` per heating zone
   (device type `Thermostat`) and per hot water (device type `OnOffOutlet`),
-  then calls `api.matter.registerPlatformAccessories(...)`. Before registering
-  it unregisters any previously cached accessories — a deliberate workaround so
-  that after a full Homebridge restart the endpoints are rebuilt fresh from the
-  running Matter.js instance.
+  then calls `api.matter.registerPlatformAccessories(...)`. What happens to
+  previously cached accessories depends on the Homebridge generation — see
+  5.7.
 - **Command handlers**: `handlers.thermostat.systemModeChange` /
   `occupiedHeatingSetpointChange` and `handlers.onOff.on/off/toggle` map Home
   app actions to `HiveApi` calls. Homebridge's `HomebridgeThermostatServer`
   invokes these handler names when the corresponding attributes change.
 - **State sync**: `updateHeating` / `updateHotWater` push the latest polled
-  values back via `api.matter.updateAccessoryState(...)`.
+  values back via `api.matter.updateAccessoryState(...)`, including
+  reachability (5.8).
 
 ### Why device types come from `api.matter.deviceTypes`
 
@@ -87,8 +87,10 @@ Matter instance. This was fixed earlier on the branch (commit `e2eca4b`).
   selection (`SystemMode Cool is not allowed with ControlSequenceOfOperation
   HeatingOnly`), making it inert. Mode mapping: Hive `OFF` ↔ Matter `Off`; Hive
   `SCHEDULE` ↔ Matter `Auto` (Matter has no schedule mode, so Auto drives the
-  Hive schedule); any other Hive mode (`MANUAL`/`BOOST`) ↔ Matter `Heat`.
-  This matches the HAP thermostat, which likewise maps Auto → schedule.
+  Hive schedule); `MANUAL` ↔ Matter `Heat`. A boosting zone shows the mode it
+  returns to when the boost ends (the API layer reads it from Hive), or `Heat`
+  when Hive does not say. This matches the HAP thermostat, which likewise maps
+  Auto → schedule.
   `thermostatRunningMode` is published (valid because the AutoMode feature is
   present) to convey heat/off running state.
 - Hot water → Matter **OnOffOutlet** used as a boost switch. On = start boost
@@ -223,14 +225,23 @@ missing — an unregistered handler is a hard `Status.Failure` to the controller
 not a silent no-op. All four are registered:
 
 - `systemModeChange` → Hive mode (Off / schedule / manual).
-- `occupiedHeatingSetpointChange` → `setHeatingTarget`.
+- `occupiedHeatingSetpointChange` → `setHeatingTarget`. On a zone that is on
+  its schedule this sends only the target, which Hive treats as an override
+  until the next scheduled change; otherwise it sends `MANUAL` with it.
 - `occupiedCoolingSetpointChange` → repairs the endpoint. Cooling is live on
   every generation, so a controller can write this setpoint, and matter.js then
   reconciles the pair and drags the **heating** setpoint down with it (see 5.4).
-- `setpointRaiseLower` → applies the delta (0.1 °C steps) to the heating target,
-  clamped to the Hive range. A Cool-only adjustment is left alone here:
-  Homebridge runs matter.js's own implementation after the handler returns, so
-  the cooling setpoint it moves is repaired by the handler above.
+- `setpointRaiseLower` → Homebridge runs matter.js's own implementation after
+  the handler returns, and that is what moves the endpoint. A **Heat**
+  adjustment therefore reaches Hive through `occupiedHeatingSetpointChange`,
+  and a **Cool** one is repaired by the cooling handler; the handler does
+  nothing for either (acting there too sent Hive every Heat adjustment twice).
+  **Both** is the exception: matter.js moves the pair together and the cooling
+  setpoint is pinned to the top of its range, so a raise has no room and is
+  cancelled outright, and a lower makes the heating change collateral of a
+  cooling write. For Both, the handler itself applies the delta (0.1 °C steps)
+  to the heating target, clamped to the Hive range. All of this was observed
+  on real endpoints (`scripts/verify-matter.mjs`), not inferred.
 
 ### 5.4 ⚠️ Homebridge hands the plugin its own writes back
 
@@ -238,20 +249,30 @@ There is no local-actor guard anywhere in the chain: `HomebridgeThermostatServer
 reacts to attribute *changes*, and matter.js does not distinguish a write made
 by the plugin (`updateAccessoryState` → `endpoint.set()`) from one made by a
 controller. Every value a poll pushes therefore arrives back at this plugin's
-own handlers, which would forward it to Hive as a user request — and
-`setHeatingTarget()` sends `mode: MANUAL`, so a temperature change made *by the
-Hive schedule* would echo back and switch the zone off that schedule.
+own handlers, which would forward it to Hive as a user request — a
+temperature change made *by the Hive schedule* would come back as a manual
+setpoint.
 
 The plugin records each value it is about to write (`expectEcho()`) and
-consumes the matching callback (`isEcho()`). A second guard covers the deadband
+consumes the matching callback (`isEcho()`). A write that does not change the
+endpoint produces no callback, so its expectation lingers, and every poll
+re-expects the current values. That is only safe because a genuine change
+**discards** the attribute's expectations: before it did, a controller moving
+20 → 21 → 20 within one poll interval had its second write swallowed as an
+echo of the 20 the last poll had re-asserted, and Hive never heard it.
+Expectations are kept oldest-first, so writes in flight together are each
+recognised. A second guard covers the deadband
 drag: writing the cooling setpoint makes matter.js move the heating setpoint
 inside the same transaction, reported as an ordinary heating change. The
 originating attribute commits first, so `occupiedCoolingSetpointChange` always
 runs before the heating change it causes and can mark it as collateral
-(`reconcilingSetpoints`), dropping the marker on the next tick.
+(`reconcilingSetpoints`), dropping the marker on the next tick. The drag is
+checked before the echo, so it does not discard the expectations queued by the
+repair it triggered.
 
-Both guards fail safe: the worst case is a redundant command to Hive that is
-skipped, never a wrong one that is sent.
+The one window left open is a controller change landing in the same tick as a
+plugin write still in flight; its worst case is sending Hive the value it
+already has.
 
 ### 5.5 `updateHeating()` writes systemMode separately
 
@@ -290,7 +311,50 @@ last thing `discoverDevices()` does, so an exception there would otherwise leave
 the poll timer unarmed and cost the user their plain HomeKit accessories over a
 Matter-only problem.
 
-### 5.7 Verifying changes locally
+The retry rebuilds only the thermostats; the hot water endpoints are healthy
+and are left alone.
+
+### 5.7 Registration and Homebridge's cache restore
+
+Homebridge 2.3 and later restore cached Matter accessories into the bridge
+before plugins start, and adopt one when the plugin re-registers its UUID:
+they keep the endpoint where the shape is unchanged, and rebuild it themselves
+where it is not. 2.3 compares only the device-type name, so both endpoints are
+adopted there. 2.4 also compares the composed behaviours, and the cache records
+a device type by name only, so the plugin's composed thermostat is rebuilt on
+every restart while the hot water outlet is kept.
+
+`register()` decides per accessory, from what it can observe rather than the
+version: a cached accessory whose state Homebridge can already read was
+restored, and is left for Homebridge to adopt — unless its product has left the
+account. Anything cached but not restored (2.2 restores nothing) is cleared
+before registering, as it always was; older Homebridge could not reuse a cached
+endpoint at all (it came from another matter.js module instance: `identify is
+not a Behavior.Type`).
+
+Earlier versions of the plugin unregistered everything first. On 2.4 that
+meant the thermostat was unregistered twice at once (by the plugin and by
+Homebridge's own "changed structure" path) and the outlet was torn down and
+rebuilt on every restart. Endpoint numbers survived either way, so controllers
+saw the same devices.
+
+Unregistering is fire-and-forget — Homebridge returns before the endpoint is
+closed and drops it from its live map only once it has — so a live UUID must
+never be unregistered and then registered again straight away. The flow above
+never does: a restored endpoint is either adopted or belongs to a product that
+has gone, and the Presets retry (5.6) only rebuilds thermostats that never came
+online.
+
+### 5.8 Reachability
+
+Every bridged endpoint carries `bridgedDeviceBasicInformation.reachable`.
+`updateHeating()` / `updateHotWater()` set it from Hive's per-device `online`
+flag, and `markUnreachable()` clears it on every accessory once three polls in a
+row have failed — the Matter counterpart of HomeKit's `No Response`. The next
+successful poll restores it. Homebridge builds whose `clusterNames` do not name
+the cluster are left alone.
+
+### 5.9 Verifying changes locally
 
 Conformance failures surface as a whole endpoint silently failing to come
 online, so they are easy to ship. Prove a change instead of reasoning about it:
@@ -303,12 +367,31 @@ plugin produces. Drive it from an `.mjs` script (`homebridge` is ESM, the plugin
 compiles to CJS — use `createRequire` for `dist/`), give each `ServerNode` a
 unique id and its own port, and clean up `~/.matter/<id>` afterwards.
 
+Two tools do this now:
+
+- `npm test` covers the handler logic against a model of Homebridge's
+  MatterAPI (`test/helpers.js`): updates land a tick later, and thermostat
+  handlers fire only when an attribute actually changes.
+- `scripts/verify-matter.mjs` runs the Matter layer against a real Homebridge
+  `MatterServer` and real matter.js endpoints, with the node kept offline:
+  conformance, what matter.js's own command implementations hand back to the
+  plugin, echo handling, reachability, and a restart from cache. It imports
+  Homebridge internals, so it is not part of `npm test`; CI runs it against
+  each regime's release (2.2.1, 2.3.1, 2.4.0). Locally:
+  `npm run build && node scripts/verify-matter.mjs`, with `HOMEBRIDGE_MODULES`
+  pointing at another install to target another release.
+
+  One harness detail matters on <= 2.2.x: matter.js only marks the thermostat
+  occupied when the node goes online, and until then setpoint commands move
+  the *unoccupied* setpoints. The script does what going online would before
+  it starts checking.
+
 ## 6. Verifying on the Raspberry Pi
 
 ```bash
 cd ~
 sudo rm -rf /home/homebridge/homebridge-hive-thermostat
-git clone -b codex/matter-support https://github.com/florida117/Homebridge-Hive-Thermostat.git /tmp/hive-build
+git clone https://github.com/florida117/Homebridge-Hive-Thermostat.git /tmp/hive-build
 sudo cp -r /tmp/hive-build /home/homebridge/homebridge-hive-thermostat
 sudo chown -R homebridge:homebridge /home/homebridge/homebridge-hive-thermostat
 sudo hb-service shell

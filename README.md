@@ -38,8 +38,9 @@ setup prefers.
 - Each heating zone exposed as a HomeKit **Thermostat** (current temp, target temp, off / heat / schedule)
 - Hot water exposed as a **Switch** with a timed boost (like homebridge-nest): flip it on to run hot water for a configurable number of minutes, flip it off to cancel
 - Optional Homebridge v2 **Matter** support: heating zones are also exposed as Matter Thermostats and hot water boosts as Matter On/Off Outlets
-- Reports **No Response** in the Home app when Hive marks a device offline, rather than showing stale data
+- Reports **No Response** in the Home app when Hive marks a device offline, or when Hive itself stops answering, rather than showing stale data (Matter controllers see the device as unreachable)
 - One-time SMS 2FA during setup, then silent token refresh — no repeated SMS prompts
+- Keeps retrying sign-in if Homebridge starts before your network does (after a power cut, say), instead of waiting for a restart
 - Configurable poll interval
 
 ## Mode mapping
@@ -52,13 +53,24 @@ setup prefers.
 | Manual    | Heat          |
 | Schedule  | Auto          |
 
+During a boost started from the Hive app, the zone shows the mode it will
+return to when the boost ends.
+
+Changing the temperature while a zone is in **Auto** keeps it on its schedule:
+Hive treats the new temperature as an override until the next scheduled
+change. In any other mode, changing the temperature switches the zone to
+**Heat** (manual) at that temperature.
+
 ### Matter
 
-| Hive mode      | Matter thermostat system mode |
-|----------------|--------------------------------|
-| Off            | Off                            |
-| Manual / Boost | Heat                           |
-| Schedule       | Auto                           |
+| Hive mode | Matter thermostat system mode |
+|-----------|--------------------------------|
+| Off       | Off                            |
+| Manual    | Heat                           |
+| Schedule  | Auto                           |
+
+As with HomeKit, a boost shows the mode the zone will return to, and a
+temperature change in Auto is a temporary override.
 
 > The Matter thermostat also shows a **Cool** button. Matter only offers an
 > **Auto** mode when the Cooling feature is present, so Cooling is advertised to

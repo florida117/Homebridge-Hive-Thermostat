@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.0] - 2026-10-04
+
+**Reliability and Matter fixes from a second full review, plus one change in
+behaviour:** changing the temperature while a zone is on its schedule now
+keeps it on the schedule.
+
+### Fixed
+- **A network failure at startup no longer leaves the plugin dead until a
+  restart.** If Homebridge started before your network (after a power cut),
+  sign-in failed once and was never retried — and could text you a 2FA code you
+  had not asked for. Sign-in now retries with backoff, keeping your stored
+  session.
+- **A Matter controller changing a value and changing it back between polls
+  lost the second change.** Hive never heard it, and the controller snapped
+  back to the first value.
+- **Raising or lowering the temperature over Matter sent Hive the change twice.**
+- **Stale values are no longer shown as live.** If Hive stops answering, or
+  before it first answers after a restart, accessories show No Response
+  (Matter: unreachable) instead of the last values Hive sent. Matter also now
+  reflects Hive's own offline flag.
+- **A stalled Hive sign-in call can no longer hold polling up for minutes**;
+  every call now has a 15-second deadline.
+- Changing the Hive account in the config no longer keeps using the old
+  account's stored session.
+- Cancelling a hot water boost whose previous mode Hive did not report now
+  returns to the schedule.
+
+### Changed
+- **Changing the temperature while a zone is on its schedule now keeps it on
+  the schedule**, as a temporary override until the next scheduled change.
+  Previously it switched the zone to manual for good.
+- On Homebridge 2.3 and later, Matter accessories restored from cache are
+  adopted rather than torn down and rebuilt on every restart.
+- The plugin now has an automated test suite, and every change is checked
+  against real Matter endpoints on each supported Homebridge release (2.2,
+  2.3 and 2.4) before it ships.
+
 ## [1.0.9] - 2026-09-24
 
 **Reliability fixes from a full review of the plugin.** Three of these could

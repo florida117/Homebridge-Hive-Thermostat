@@ -11,8 +11,8 @@
  */
 
 import type { Logger } from 'homebridge';
-import { HIVE_URLS } from './settings';
-import { fetchWithTimeout } from './fetchWithTimeout';
+import { HIVE_URLS, HIVE_USER_AGENT } from './settings';
+import { fetchWithTimeout } from './timeout';
 
 export type HiveMode = 'SCHEDULE' | 'MANUAL' | 'OFF' | 'BOOST';
 
@@ -34,7 +34,10 @@ export interface HiveHeatingZone {
   online: boolean;
   currentTemperature: number;
   targetTemperature: number;
+  /** While boosting, the mode the zone returns to when the boost ends. */
   mode: HiveMode;
+  /** Whether a boost is currently active. */
+  boosting: boolean;
   /** Whether the boiler is actively calling for heat right now. */
   heating: boolean;
 }
@@ -44,13 +47,15 @@ export interface HiveHotWater {
   type: 'hotwater';
   name: string;
   online: boolean;
+  /**
+   * The zone's resting mode. While boosting, this is the mode a cancelled boost
+   * returns to — never BOOST itself.
+   */
   mode: HiveMode;
   /** Whether hot water is currently on. */
   on: boolean;
   /** Whether a manual boost is currently active. */
   boosting: boolean;
-  /** The mode to return to when a boost is cancelled. */
-  previousMode: HiveMode;
 }
 
 export interface HiveState {
@@ -69,9 +74,7 @@ export class HiveApi {
       'content-type': 'application/json',
       'accept': 'application/json',
       'authorization': this.getIdToken(),
-      'User-Agent':
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
-        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      'User-Agent': HIVE_USER_AGENT,
     };
   }
 
@@ -125,8 +128,9 @@ export class HiveApi {
     const state = p.state ?? {};
     const props = p.props ?? {};
     let mode: HiveMode = state.mode ?? 'SCHEDULE';
+    const boosting = mode === 'BOOST';
     // When boosting, the "real" underlying mode is stashed in props.previous.
-    if (mode === 'BOOST' && props.previous?.mode) {
+    if (boosting && props.previous?.mode) {
       mode = props.previous.mode;
     }
     return {
@@ -137,6 +141,7 @@ export class HiveApi {
       currentTemperature: Number(props.temperature ?? 0),
       targetTemperature: Number(state.target ?? state.heat ?? 20),
       mode,
+      boosting,
       heating: props.working === true,
     };
   }
@@ -147,8 +152,9 @@ export class HiveApi {
     const rawMode: HiveMode = state.mode ?? 'SCHEDULE';
     const boosting = rawMode === 'BOOST';
     // When boosting, the "real" underlying mode is stashed in props.previous.
-    const previousMode: HiveMode =
-      boosting && props.previous?.mode ? props.previous.mode : rawMode;
+    // Without it, SCHEDULE is the safe place to return to: sending BOOST back
+    // as the mode to cancel to would ask Hive for a boost with no duration.
+    const mode: HiveMode = boosting ? props.previous?.mode ?? 'SCHEDULE' : rawMode;
     const baseName = state.name ?? 'Hot Water';
     // Hive often names the hot water product the same as a heating zone (e.g.
     // "Downstairs"), which collides with that zone's thermostat in HomeKit.
@@ -161,10 +167,9 @@ export class HiveApi {
       type: 'hotwater',
       name,
       online,
-      mode: previousMode,
+      mode,
       on: props.working === true,
       boosting,
-      previousMode: boosting ? previousMode : rawMode,
     };
   }
 
@@ -211,8 +216,24 @@ export class HiveApi {
     return text.replace(/\s+/g, ' ').slice(0, 300);
   }
 
-  setHeatingTarget(id: string, temp: number): Promise<void> {
-    return this.setNodeState('heating', id, { mode: 'MANUAL', target: temp });
+  /**
+   * Set a zone's target temperature. `current` is the zone's latest known
+   * state, which decides what the change means.
+   *
+   * On the schedule, only the target is sent — what pyhiveapi (Home
+   * Assistant's Hive library) sends in every mode — so the zone stays on its
+   * schedule and Hive treats the new target as an override until the next
+   * scheduled change. Anywhere else a new target means "heat to this now",
+   * which is MANUAL. A boosting zone keeps that MANUAL behaviour too: what a
+   * bare target does to a running boost has not been established.
+   */
+  setHeatingTarget(id: string, temp: number, current?: HiveHeatingZone): Promise<void> {
+    const onSchedule = current?.mode === 'SCHEDULE' && !current.boosting;
+    return this.setNodeState(
+      'heating',
+      id,
+      onSchedule ? { target: temp } : { mode: 'MANUAL', target: temp },
+    );
   }
 
   setHeatingMode(id: string, mode: HiveMode): Promise<void> {
@@ -229,12 +250,12 @@ export class HiveApi {
   }
 
   /**
-   * Cancel a hot water boost, returning to the previous mode.
-   * `previousMode` is the mode the zone was in before boosting (defaults to
-   * SCHEDULE, which is the most common resting state).
+   * Cancel a hot water boost, returning to `returnTo` — the zone's resting
+   * mode (see {@link HiveHotWater.mode}). Defaults to SCHEDULE, the most
+   * common resting state.
    */
-  cancelHotWaterBoost(id: string, previousMode: HiveMode = 'SCHEDULE'): Promise<void> {
-    return this.setNodeState('hotwater', id, { mode: previousMode });
+  cancelHotWaterBoost(id: string, returnTo: HiveMode = 'SCHEDULE'): Promise<void> {
+    return this.setNodeState('hotwater', id, { mode: returnTo });
   }
 }
 

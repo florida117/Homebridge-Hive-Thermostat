@@ -10,7 +10,7 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 - Hive hot water products become HomeKit `Switch` accessories.
 - On Homebridge v2 with Matter enabled, Hive heating products also become Matter `Thermostat` accessories.
 - On Homebridge v2 with Matter enabled, Hive hot water products also become Matter On/Off Outlet accessories for manual boost control.
-- Offline Hive devices are surfaced as HomeKit communication failures, so Home shows `No Response` instead of stale values.
+- Offline Hive devices are surfaced as HomeKit communication failures, so Home shows `No Response` instead of stale values — as is everything, once Hive itself stops answering. Matter accessories are marked unreachable in the same cases.
 - HomeKit changes are sent back to Hive through the Beekeeper API, then confirmed by a short follow-up poll.
 
 ## Main files
@@ -27,6 +27,9 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 | `src/heatingAccessory.ts` | Maps each Hive heating zone to a HomeKit thermostat service. |
 | `src/hotWaterAccessory.ts` | Maps each Hive hot water product to a HomeKit switch service for timed boost control. |
 | `src/matterPlatform.ts` | Registers and updates optional Homebridge v2 Matter accessories. |
+| `src/timeout.ts` | Deadlines for every network call: `fetchWithTimeout()` for the plugin's own requests, `withTimeout()` for Cognito's. |
+| `test/` | `node:test` suite, run against the compiled plugin in `dist/`. |
+| `scripts/verify-matter.mjs` | Checks the Matter layer against a real Homebridge Matter server; CI runs it for each supported Homebridge release. |
 | `tsconfig.json` | Strict TypeScript configuration. Builds `src/**/*.ts` to CommonJS JavaScript in `dist/`. |
 | `README.md` | User-facing installation and setup instructions. |
 | `CHANGELOG.md` | Release history. |
@@ -37,7 +40,12 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 2. `src/index.ts` registers a platform named `HiveThermostat` from `src/platform.ts`.
 3. Homebridge constructs `HiveThermostatPlatform` with the user's config.
 4. The platform waits for Homebridge's `DID_FINISH_LAUNCHING` event before starting.
-5. The platform authenticates with Hive.
+   It first binds handlers to the accessories restored from Homebridge's cache,
+   so they report `No Response` — and refuse writes — until Hive has answered,
+   rather than serving the values cached at the last shutdown.
+5. The platform authenticates with Hive. If Hive cannot be reached (Homebridge
+   often starts before the network after a power cut), it retries with backoff
+   from 30 seconds up to 30 minutes.
 6. It fetches all Hive nodes from the Hive cloud API.
 7. It registers, restores, updates, or removes cached HomeKit accessories.
 8. If Homebridge Matter is enabled and plugin Matter support is not disabled, it registers corresponding Matter accessories.
@@ -64,11 +72,26 @@ The login sequence is:
 1. Try to load a stored refresh token from Homebridge storage at `.hive-thermostat-tokens.json`.
 2. If that works, refresh the Cognito session silently.
 3. If no refresh token exists, or Hive rejects it, perform a username/password login.
+   A refresh that fails only because Hive or Cognito could not be reached is
+   retried with the same token instead — falling through to a login would text
+   the user a 2FA code they did not ask for.
 4. If Hive requires SMS MFA, log a clear setup prompt.
 5. The user enters the SMS code into the Homebridge config field `smsCode` and restarts Homebridge.
 6. The plugin submits that SMS code, receives tokens, and stores the refresh token for future restarts.
 
-Only the refresh token is persisted. The file is written with mode `0600` where possible.
+Only the refresh token is persisted, with the username it belongs to: Cognito's
+refresh flow does not check the account, so a token from a previous account
+would otherwise be honoured silently after the username changed. (Files from
+1.0.9 and earlier have no username and are trusted.) The file is written with
+mode `0600` where possible.
+
+Failures are classified by `isTransientAuthError()`. Anything without a Cognito
+`…Exception` code — a network failure, a timeout, the SSO page not loading — and
+Cognito's own service errors are retried; a verdict on the account (a wrong
+password, a revoked token, a rejected 2FA code) is not, since repeating a wrong
+password counts towards Cognito's lockout. Every Cognito call has a 15-second
+deadline (`withTimeout()`), because `amazon-cognito-identity-js` makes its
+requests with none.
 
 ## Hive API layer
 
@@ -89,11 +112,12 @@ The response contains products and devices. Product entries contain heating and 
 Commands are posted to:
 
 ```text
-https://beekeeper-uk.hivehome.com/1.0/nodes/{type}/{id}
+https://beekeeper.hivehome.com/1.0/nodes/{type}/{id}
 ```
 
-If Hive returns `404 NOT_FOUND` on that host, the client retries the legacy
-`https://beekeeper.hivehome.com/1.0` host before surfacing the error.
+If that host answers `403` or `404` — the gateway's way of saying it does not
+route the request — the client retries the regional
+`https://beekeeper-uk.hivehome.com/1.0` host before surfacing the error.
 
 Supported writes are:
 
@@ -118,7 +142,7 @@ Hive mode mapping:
 | `OFF` | `OFF` |
 | `MANUAL` | `HEAT` |
 | `SCHEDULE` | `AUTO` |
-| `BOOST` | Treated as `HEAT`, with the underlying mode normalized in the API layer where available. |
+| `BOOST` | Shown as the mode the zone returns to when the boost ends (read from Hive), or `HEAT` when Hive does not say. |
 
 Thermostat values:
 
@@ -127,7 +151,10 @@ Thermostat values:
 - Current heating state is `HEAT` when Hive says the zone is actively working, otherwise `OFF`.
 - Temperature bounds are 5-32 C with 0.5 C steps.
 
-Setting a target temperature from HomeKit changes the Hive zone to `MANUAL` mode.
+Setting a target temperature on a zone that is on its schedule sends only the
+target, so the zone stays on the schedule and Hive treats it as an override
+until the next scheduled change (this is what pyhiveapi sends). In any other
+mode — boosting included — it sends `MANUAL` with the target.
 
 ## Matter mapping
 
@@ -139,10 +166,9 @@ Heating zones are represented as Matter Thermostats:
 | --- | --- |
 | `OFF` | `Off` |
 | `MANUAL` | `Heat` |
-| `SCHEDULE` | `Heat` |
-| `BOOST` | `Heat` |
+| `SCHEDULE` | `Auto` |
 
-Temperatures are converted from Hive Celsius values to Matter centi-degrees Celsius. Matter writes to `occupiedHeatingSetpoint` call the Hive target-temperature API and therefore put the zone into Hive `MANUAL` mode.
+Temperatures are converted from Hive Celsius values to Matter centi-degrees Celsius. Matter writes to `occupiedHeatingSetpoint` go through the same target-temperature call as HomeKit, with the same schedule behaviour.
 
 The Matter thermostat uses Homebridge's bridge-provided thermostat endpoint type
 so it shares the same Matter.js module instance as the running bridge. Hive does
@@ -189,12 +215,19 @@ After HomeKit sends a command, the plugin schedules a one-off poll about 4 secon
 
 Both reads and commands recover from an expired Cognito session: a 401 raises
 `TokenExpiredError`, the platform refreshes the tokens once and replays the
-request. Commands run through the platform's own `setHeatingMode` /
+request. Refreshes are single-flight, so a poll and a command that both hit a
+401 share one. Commands run through the platform's own `setHeatingMode` /
 `setHeatingTarget` / `setHotWaterBoost` / `cancelHotWaterBoost` wrappers rather
 than touching `HiveApi` directly, so HomeKit and Matter share that recovery.
 A refresh token that is rejected outright is reported once at error level and
 thereafter at debug, since polling continues and the failure is permanent until
 the user re-authenticates.
+
+After three polls in a row fail, every accessory is reported unreachable —
+HomeKit `No Response`, Matter `reachable: false` — until the next successful
+poll. Hive's per-device `online` flag only covers a device dropping off Hive's
+own network; without this, an outage of Hive itself (or a revoked session)
+would leave the last values on show as though they were live.
 
 ## Configuration
 
@@ -225,7 +258,7 @@ Available config fields:
 
 ## Build and development
 
-The package targets Homebridge v2 and Node.js versions supported by Homebridge v2 Matter, currently Node 22 or Node 24.
+The package targets Homebridge v2 and Node.js 22, 24 or 26 (`engines.node`).
 
 Useful commands:
 
@@ -233,11 +266,25 @@ Useful commands:
 npm run build
 npm run watch
 npm run lint
+npm test
 ```
 
 `npm run build` removes `dist/` and runs the TypeScript compiler. The package entry point is `dist/index.js`.
 
-There are currently no automated tests defined in `package.json`.
+`npm test` builds, then runs the `node:test` suite in `test/` against
+`dist/`. HomeKit is exercised through real HAP-NodeJS characteristics; Matter
+through a model of Homebridge's MatterAPI that, like the real one, applies
+updates a tick later and calls the plugin's thermostat handlers only when an
+attribute actually changes. CI runs it on every supported Node version, and the
+release workflow runs it before anything is published.
+
+`scripts/verify-matter.mjs` goes further than that model can: it runs the
+Matter layer against a real Homebridge Matter server and real matter.js
+endpoints, across a restart from cache. It reaches into Homebridge's internal
+modules, so it is not part of `npm test`; CI runs it against every supported
+Homebridge release (2.2.1, 2.3.1 and 2.4.0) instead. Run it locally after any
+change to `src/matterPlatform.ts` — the header of the script says how to point
+it at another release.
 
 ## Releasing
 
