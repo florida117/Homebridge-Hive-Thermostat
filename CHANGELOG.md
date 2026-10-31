@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.1] - 2026-10-31
+
+**Follow-up fixes to 1.1.0.**
+
+### Fixed
+- **Matter accessories could show the state from the last shutdown for a full
+  poll interval after a restart.** Since 1.1.0 keeps restored accessories
+  instead of rebuilding them, they now get the current Hive state as soon as
+  they are registered.
+- **A slow Hive sign-in could text you a new 2FA code at every retry.** A login
+  that times out, or a 2FA code that could not be submitted, is no longer
+  retried automatically; restart Homebridge to try again. Network failures
+  before anything reaches Hive are still retried.
+- On Homebridge 2.4, the Matter thermostat check could pass on the endpoint
+  restored from cache before Homebridge had replaced it, hiding a thermostat
+  that failed to come online. The plugin now replaces it itself before
+  checking.
+- A device Hive stops reporting now shows No Response instead of its last
+  values.
+- Cached accessories no longer show stale values when the username or password
+  is missing from the config.
+- A failed Matter thermostat update no longer stops its reachability being
+  updated.
+
 ## [1.1.0] - 2026-10-04
 
 **Reliability and Matter fixes from a second full review, plus one change in

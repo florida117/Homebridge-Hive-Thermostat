@@ -34,7 +34,14 @@ import {
   STARTUP_RETRY_MAX_MS,
   STARTUP_RETRY_MIN_MS,
 } from './settings';
-import { HiveAuth, HiveSmsRequired, HiveTokens, isTransientAuthError } from './hiveAuth';
+import {
+  HiveAuth,
+  HiveAuthActionRequired,
+  HiveSmsRequired,
+  HiveTokens,
+  isTransientAuthError,
+} from './hiveAuth';
+import { HiveTimeoutError } from './timeout';
 import { HiveApi, HiveHeatingZone, HiveMode, HiveState, TokenExpiredError } from './hiveApi';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
@@ -152,16 +159,20 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       '.hive-thermostat-matter.json',
     );
 
-    if (!this.cfg.username || !this.cfg.password) {
+    const configured = !!this.cfg.username && !!this.cfg.password;
+    if (!configured) {
       this.log.error(
         'Hive username and password are required. Set them in the plugin config.',
       );
-      return;
     }
 
     this.homebridgeApi.on(APIEvent.DID_FINISH_LAUNCHING, () => {
+      // Even with no way to sign in, cached accessories must not pass off the
+      // values from the last shutdown as live.
       this.attachCachedHandlers();
-      this.startup();
+      if (configured) {
+        this.startup();
+      }
     });
 
     this.homebridgeApi.on(APIEvent.SHUTDOWN, () => {
@@ -277,6 +288,15 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       this.log.info('Hive: logged in (no 2FA required).');
       return true;
     } catch (err) {
+      if (err instanceof HiveTimeoutError) {
+        // Unlike a network failure, a timeout does not mean the request went
+        // unanswered: Cognito may have accepted the password and texted a 2FA
+        // code. Retrying would text another one at every backoff step.
+        throw new HiveAuthActionRequired(
+          `${err.message} Not retried automatically, since each attempt can ` +
+            'send a new 2FA code; restart Homebridge to try again.',
+        );
+      }
       if (!(err instanceof HiveSmsRequired)) {
         throw err;
       }
@@ -300,12 +320,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       this.log.info('Hive: 2FA accepted. You can now clear the smsCode field.');
       return true;
     } catch (err) {
-      if (isTransientAuthError(err)) {
-        throw err;
-      }
+      // Never retried, whatever the cause: a retry starts a fresh login, which
+      // texts a new code and makes the configured one stale.
       this.log.error(
-        `Hive: 2FA code rejected (${(err as Error).message}). ` +
-          'Request a new code and update the smsCode field.',
+        isTransientAuthError(err)
+          ? `Hive: could not submit the 2FA code (${(err as Error).message}). ` +
+              'Restart Homebridge to try again; you may need a new code.'
+          : `Hive: 2FA code rejected (${(err as Error).message}). ` +
+              'Request a new code and update the smsCode field.',
       );
       return false;
     }
@@ -654,6 +676,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   }
 
   private applyState(state: HiveState): void {
+    // A product Hive no longer reports has nothing live to show: report it
+    // unreachable, rather than leave whatever it last had on display.
+    const reported = new Set([...state.zones, ...state.hotWater].map((p) => p.id));
+    for (const [id, handler] of this.handlers) {
+      if (!reported.has(id)) {
+        handler.markUnreachable();
+      }
+    }
     for (const zone of state.zones) {
       const h = this.handlers.get(zone.id);
       if (h instanceof HiveHeatingAccessory) {

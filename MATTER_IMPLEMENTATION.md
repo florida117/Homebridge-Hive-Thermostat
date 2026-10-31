@@ -327,7 +327,11 @@ every restart while the hot water outlet is kept.
 `register()` decides per accessory, from what it can observe rather than the
 version: a cached accessory whose state Homebridge can already read was
 restored, and is left for Homebridge to adopt — unless its product has left the
-account. Anything cached but not restored (2.2 restores nothing) is cleared
+account, or it is a composed thermostat. Homebridge would rebuild that one
+anyway, and `verifyThermostats()` could read the restored endpoint before the
+rebuild and pass whether or not the rebuilt one came online; so the plugin
+removes it itself and waits until it is gone (`waitUntilGone()`) before
+registering. Anything cached but not restored (2.2 restores nothing) is cleared
 before registering, as it always was; older Homebridge could not reuse a cached
 endpoint at all (it came from another matter.js module instance: `identify is
 not a Behavior.Type`).
@@ -340,10 +344,14 @@ saw the same devices.
 
 Unregistering is fire-and-forget — Homebridge returns before the endpoint is
 closed and drops it from its live map only once it has — so a live UUID must
-never be unregistered and then registered again straight away. The flow above
-never does: a restored endpoint is either adopted or belongs to a product that
-has gone, and the Presets retry (5.6) only rebuilds thermostats that never came
-online.
+never be unregistered and then registered again straight away. That is why the
+composed thermostat is waited out; otherwise a restored endpoint is either
+adopted or belongs to a product that has gone, and the Presets retry (5.6) only
+rebuilds thermostats that never came online.
+
+Once registered, every accessory is sent the latest Hive state straight away:
+updates that arrived before registration were only recorded, and an adopted
+endpoint still holds what was cached at the last shutdown.
 
 ### 5.8 Reachability
 

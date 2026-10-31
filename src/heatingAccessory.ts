@@ -22,18 +22,17 @@ import { PlatformAccessory, Service, CharacteristicValue } from 'homebridge';
 import type { HiveThermostatPlatform } from './platform';
 import { HiveHeatingZone, HiveMode } from './hiveApi';
 import { HIVE_MIN_TEMP, HIVE_MAX_TEMP, HIVE_TEMP_STEP } from './settings';
+import { HiveAccessoryBase } from './accessoryBase';
 
-export class HiveHeatingAccessory {
+export class HiveHeatingAccessory extends HiveAccessoryBase<HiveHeatingZone> {
   private readonly service: Service;
-  private latest?: HiveHeatingZone;
-  /** Set while Hive is not answering; cleared by the next update(). */
-  private unreachable = false;
 
   constructor(
-    private readonly platform: HiveThermostatPlatform,
+    platform: HiveThermostatPlatform,
     private readonly accessory: PlatformAccessory,
     private readonly hiveId: string,
   ) {
+    super(platform, () => this.service, platform.Characteristic.CurrentTemperature);
     const { Service, Characteristic } = this.platform;
 
     this.accessory
@@ -83,15 +82,10 @@ export class HiveHeatingAccessory {
 
   /** Push fresh state into HomeKit. */
   update(zone: HiveHeatingZone): void {
-    this.latest = zone;
-    this.unreachable = false;
-    const { Characteristic } = this.platform;
-
-    if (!zone.online) {
-      // Mark unreachable; getters will throw NO_RESPONSE.
-      this.reportUnreachable();
+    if (!this.accept(zone)) {
       return;
     }
+    const { Characteristic } = this.platform;
 
     this.service.updateCharacteristic(
       Characteristic.CurrentTemperature,
@@ -111,32 +105,7 @@ export class HiveHeatingAccessory {
     );
   }
 
-  /** Hive has stopped answering; see HiveThermostatPlatform.markUnreachable(). */
-  markUnreachable(): void {
-    this.unreachable = true;
-    this.reportUnreachable();
-  }
-
-  private reportUnreachable(): void {
-    this.service.updateCharacteristic(
-      this.platform.Characteristic.CurrentTemperature,
-      this.communicationFailure(),
-    );
-  }
-
   // ---- getters -------------------------------------------------------------
-
-  private guard<T>(fn: () => T): T {
-    if (!this.latest || !this.latest.online || this.unreachable) {
-      throw this.communicationFailure();
-    }
-    return fn();
-  }
-
-  private communicationFailure() {
-    const { HapStatusError, HAPStatus } = this.platform.homebridgeApi.hap;
-    return new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-  }
 
   private currentState(): number {
     const { Characteristic } = this.platform;
@@ -158,18 +127,6 @@ export class HiveHeatingAccessory {
   }
 
   // ---- setters -------------------------------------------------------------
-
-  /**
-   * The zone's state, for a write to act on. Until a poll has delivered one
-   * there is nothing to act on — Hive may not even be signed in yet — so the
-   * write is refused rather than silently accepted.
-   */
-  private requireState(): HiveHeatingZone {
-    if (!this.latest) {
-      throw this.communicationFailure();
-    }
-    return this.latest;
-  }
 
   private async setTargetState(value: CharacteristicValue): Promise<void> {
     const latest = this.requireState();

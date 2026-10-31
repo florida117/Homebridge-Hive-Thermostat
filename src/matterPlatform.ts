@@ -75,6 +75,8 @@ type ThermostatComposition = {
   deviceType: MatterAccessory['deviceType'];
   /** Presets live: a non-empty `presetTypes` array is REQUIRED. */
   presets: boolean;
+  /** The plugin composed the thermostat's features itself. */
+  composed: boolean;
   /** Human-readable regime, for the startup log. */
   regime: string;
 };
@@ -180,10 +182,22 @@ export class HiveMatterPlatform {
       ...state.hotWater.map((hw) => this.hotWaterUuid(hw.id)),
     ]);
     const restored = await this.restoredUuids(matter);
+    // The one exception is a composed thermostat. Homebridge cannot adopt it —
+    // the cache records a device type by name, not the features composed onto
+    // it — so it rebuilds the endpoint itself on seeing the registration, and
+    // verification would read the restored endpoint before that and pass
+    // whether or not the rebuilt one comes online. Removing it here, and
+    // waiting until it is gone, leaves verification only the real endpoint.
+    const rebuild = new Set(
+      this.thermostat.composed
+        ? state.zones.map((zone) => this.heatingUuid(zone.id)).filter((uuid) => restored.has(uuid))
+        : [],
+    );
     await this.unregisterCached(
       matter,
-      (uuid) => !live.has(uuid) || !restored.has(uuid),
+      (uuid) => !live.has(uuid) || !restored.has(uuid) || rebuild.has(uuid),
     );
+    await this.waitUntilGone(matter, rebuild);
 
     if (live.size === 0) {
       this.registered = true;
@@ -230,6 +244,16 @@ export class HiveMatterPlatform {
     }
 
     this.registered = true;
+
+    // Push live state now. Updates that arrived before registration were only
+    // recorded, and an adopted endpoint still holds whatever was cached at the
+    // last shutdown, which would otherwise be on show until the next poll.
+    for (const zone of state.zones) {
+      await this.updateHeating(this.latestHeating.get(zone.id) ?? zone);
+    }
+    for (const hw of state.hotWater) {
+      await this.updateHotWater(this.latestHotWater.get(hw.id) ?? hw);
+    }
   }
 
   /**
@@ -268,6 +292,7 @@ export class HiveMatterPlatform {
       return {
         deviceType: base.with(requirements.with(...THERMOSTAT_FEATURES)),
         presets: false,
+        composed: true,
         regime: 'Homebridge >= 2.4.0, features composed by the plugin',
       };
     }
@@ -278,6 +303,7 @@ export class HiveMatterPlatform {
       return {
         deviceType: base,
         presets: true,
+        composed: false,
         regime: 'Homebridge <= 2.2.x, pre-composed device type',
       };
     }
@@ -285,6 +311,7 @@ export class HiveMatterPlatform {
     return {
       deviceType: base,
       presets: false,
+      composed: false,
       regime: 'Homebridge 2.3.x, features detected from the declared setpoints',
     };
   }
@@ -311,13 +338,10 @@ export class HiveMatterPlatform {
   /**
    * Unregister and forget the cached accessories `which` selects.
    *
-   * ⚠️ Only ever pass accessories that are not live, or that will not be
-   * registered again. Unregistering is fire-and-forget — Homebridge returns
-   * before the endpoint is closed and drops it from its live map only once it
-   * has — so re-registering a live UUID straight afterwards would race the
-   * removal. register() keeps to that: a restored endpoint is either left for
-   * Homebridge to adopt or belongs to a product that has gone, and the Presets
-   * retry only rebuilds thermostats that never came online.
+   * ⚠️ Unregistering is fire-and-forget — Homebridge returns before the
+   * endpoint is closed and drops it from its live map only once it has — so a
+   * live UUID that is about to be registered again must be waited out with
+   * waitUntilGone() first, or the registration races the removal.
    */
   private async unregisterCached(
     matter: MatterAPI,
@@ -363,6 +387,33 @@ export class HiveMatterPlatform {
       }
     }
     return restored;
+  }
+
+  /**
+   * Poll until no thermostat in `uuids` has readable state, or a short
+   * deadline passes. Where Homebridge cannot read state back there is nothing
+   * to observe.
+   */
+  private async waitUntilGone(matter: MatterAPI, uuids: Set<string>): Promise<void> {
+    if (uuids.size === 0 || typeof matter.getAccessoryState !== 'function') {
+      return;
+    }
+    const pending = new Set(uuids);
+    const deadline = Date.now() + VERIFY_DEADLINE_MS;
+    while (pending.size > 0 && Date.now() < deadline) {
+      for (const uuid of [...pending]) {
+        try {
+          if (!(await matter.getAccessoryState(uuid, matter.clusterNames.Thermostat))) {
+            pending.delete(uuid);
+          }
+        } catch {
+          pending.delete(uuid);
+        }
+      }
+      if (pending.size > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   }
 
   /** The cluster whose state shows whether `accessory` has a live endpoint. */
@@ -438,6 +489,9 @@ export class HiveMatterPlatform {
     // switched to MANUAL while the boiler is idle would report "heating" until
     // the next restart. Landing the mode change on its own lets the reaction
     // run and then be corrected by the write below.
+    // Reachability first, so a thermostat write that throws cannot hold it up.
+    await this.writeReachable(uuid, zone.online);
+
     const systemMode = this.matterModeFromHive(zone.mode);
     this.expectEcho(uuid, 'systemMode', systemMode);
     const modeChanged = await this.writeIfChanged(uuid, cluster, { systemMode }, 'mode');
@@ -467,8 +521,6 @@ export class HiveMatterPlatform {
       // unrestored cooling setpoint drags the heating setpoint down with it.
       occupiedCoolingSetpoint: coolingSetpoint,
     }, 'state');
-
-    await this.writeReachable(uuid, zone.online);
   }
 
   /**
@@ -498,8 +550,8 @@ export class HiveMatterPlatform {
     }
     const matter = this.api.matter!;
     const uuid = this.hotWaterUuid(hw.id);
-    await this.writeIfChanged(uuid, matter.clusterNames.OnOff, { onOff: hw.boosting });
     await this.writeReachable(uuid, hw.online);
+    await this.writeIfChanged(uuid, matter.clusterNames.OnOff, { onOff: hw.boosting });
   }
 
   /**
