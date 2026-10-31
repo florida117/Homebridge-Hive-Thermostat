@@ -1,4 +1,4 @@
-const { test, beforeEach } = require('node:test');
+const { test, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const matterModule = require('../dist/matterPlatform');
@@ -9,8 +9,12 @@ const HEATING = 'hive-matter-heating-zone-1';
 const HOT_WATER = 'hive-matter-hotwater-hw-1';
 const SystemMode = { Off: 0, Auto: 1, Heat: 4 };
 
+const { VERIFY_DEADLINE_MS } = matterModule;
 beforeEach(() => {
   matterModule.VERIFY_DEADLINE_MS = 300;
+});
+after(() => {
+  matterModule.VERIFY_DEADLINE_MS = VERIFY_DEADLINE_MS;
 });
 
 /**
@@ -220,7 +224,9 @@ test('reachability follows Hive, and an outage marks everything unreachable', as
 
 // ---- Registration -----------------------------------------------------------
 
-for (const regime of ['2.3', '2.4']) {
+// A composed thermostat (2.4) cannot be adopted, so the plugin rebuilds it
+// itself before verifying; everything else restored is left to Homebridge.
+for (const [regime, rebuilt] of [['2.3', []], ['2.4', [HEATING]]]) {
   test(`endpoints Homebridge ${regime} restored are left for it to adopt; only products that left are unregistered`, async () => {
     const gone = 'hive-matter-heating-gone';
     const { fake } = await setup({
@@ -232,11 +238,32 @@ for (const regime of ['2.3', '2.4']) {
       ],
     });
 
-    assert.deepEqual(fake.calls.unregistered, [gone]);
+    assert.deepEqual(fake.calls.unregistered, [...rebuilt, gone]);
     assert.deepEqual(fake.calls.conflicts, []);
     assert.ok(fake.endpoints.get(HOT_WATER).handlers, 'adopted with the plugin handlers');
+    assert.ok(fake.endpoints.get(HEATING).handlers, 'thermostat live with the plugin handlers');
   });
 }
+
+test('an adopted endpoint shows live state as soon as it is registered', async () => {
+  const fake = h.createMatter({ regime: '2.3' });
+  const restored = { ...cachedAccessory(HOT_WATER, 'hotwater'), clusters: { onOff: { onOff: true } } };
+  fake.restore(restored);
+  const platform = new HiveMatterPlatform(
+    { isMatterEnabled: () => true, matter: fake.matter },
+    h.createLog(),
+    h.recordCommands().commands,
+    30,
+  );
+  platform.configureAccessory(restored);
+
+  // As at startup: the first state arrives before registration.
+  await platform.updateHotWater(h.hotWater({ boosting: false }));
+  await platform.register({ zones: [], hotWater: [h.hotWater({ boosting: false })] });
+  await h.settle();
+
+  assert.equal(fake.state(HOT_WATER, 'onOff').onOff, false);
+});
 
 test('cached accessories Homebridge did not restore are cleared before registering', async () => {
   const { fake } = await setup({

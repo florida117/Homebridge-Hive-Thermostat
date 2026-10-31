@@ -14,19 +14,18 @@
 import { PlatformAccessory, Service, CharacteristicValue } from 'homebridge';
 import type { HiveThermostatPlatform } from './platform';
 import { HiveHotWater } from './hiveApi';
+import { HiveAccessoryBase } from './accessoryBase';
 
-export class HiveHotWaterAccessory {
+export class HiveHotWaterAccessory extends HiveAccessoryBase<HiveHotWater> {
   private readonly service: Service;
-  private latest?: HiveHotWater;
-  /** Set while Hive is not answering; cleared by the next update(). */
-  private unreachable = false;
 
   constructor(
-    private readonly platform: HiveThermostatPlatform,
+    platform: HiveThermostatPlatform,
     private readonly accessory: PlatformAccessory,
     private readonly hiveId: string,
     private readonly boostMinutes: number,
   ) {
+    super(platform, () => this.service, platform.Characteristic.On);
     const { Service, Characteristic } = this.platform;
 
     this.accessory
@@ -46,47 +45,13 @@ export class HiveHotWaterAccessory {
   }
 
   update(hw: HiveHotWater): void {
-    this.latest = hw;
-    this.unreachable = false;
-    if (!hw.online) {
-      this.reportUnreachable();
-      return;
+    if (this.accept(hw)) {
+      this.service.updateCharacteristic(this.platform.Characteristic.On, hw.boosting);
     }
-    this.service.updateCharacteristic(this.platform.Characteristic.On, hw.boosting);
-  }
-
-  /** Hive has stopped answering; see HiveThermostatPlatform.markUnreachable(). */
-  markUnreachable(): void {
-    this.unreachable = true;
-    this.reportUnreachable();
-  }
-
-  private reportUnreachable(): void {
-    this.service.updateCharacteristic(
-      this.platform.Characteristic.On,
-      this.communicationFailure(),
-    );
-  }
-
-  private guard<T>(fn: () => T): T {
-    if (!this.latest || !this.latest.online || this.unreachable) {
-      throw this.communicationFailure();
-    }
-    return fn();
-  }
-
-  private communicationFailure() {
-    const { HapStatusError, HAPStatus } = this.platform.homebridgeApi.hap;
-    return new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
 
   private async setOn(value: CharacteristicValue): Promise<void> {
-    // Refuse rather than accept a write before any poll has landed — Hive may
-    // not even be signed in yet.
-    const latest = this.latest;
-    if (!latest) {
-      throw this.communicationFailure();
-    }
+    const latest = this.requireState();
     if (value) {
       await this.platform.setHotWaterBoost(this.hiveId, this.boostMinutes);
       latest.boosting = true;

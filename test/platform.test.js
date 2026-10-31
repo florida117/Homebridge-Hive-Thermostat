@@ -1,4 +1,4 @@
-const { test, beforeEach, afterEach, mock } = require('node:test');
+const { test, beforeEach, afterEach, after, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -10,12 +10,17 @@ const { HiveThermostatPlatform } = require('../dist/platform');
 const h = require('./helpers');
 
 const { hap } = h;
+const { HiveTimeoutError } = require('../dist/timeout');
 const TOKENS = { idToken: 'id', accessToken: 'access', refreshToken: 'refresh-2' };
 const COMMUNICATION_FAILURE = hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE;
 const realFetch = globalThis.fetch;
 
+const { STARTUP_RETRY_MIN_MS } = settings;
 beforeEach(() => {
   settings.STARTUP_RETRY_MIN_MS = 10;
+});
+after(() => {
+  settings.STARTUP_RETRY_MIN_MS = STARTUP_RETRY_MIN_MS;
 });
 
 afterEach(() => {
@@ -48,7 +53,7 @@ function stubHive({
 }
 
 /** Construct the platform and let Homebridge finish launching. */
-function launch(t, { stored, cached = [] } = {}) {
+function launch(t, { stored, cached = [], config = {} } = {}) {
   const storagePath = h.tempStorage();
   const tokenFile = path.join(storagePath, '.hive-thermostat-tokens.json');
   if (stored) {
@@ -63,6 +68,7 @@ function launch(t, { stored, cached = [] } = {}) {
       username: 'me@example.com',
       password: 'secret',
       enableMatter: false,
+      ...config,
     },
     homebridge,
   );
@@ -238,4 +244,64 @@ test('a temperature change on the schedule keeps the zone on its schedule', asyn
     await characteristic(accessory, hap.Characteristic.TargetHeatingCoolingState).handleGetRequest(),
     hap.Characteristic.TargetHeatingCoolingState.AUTO,
   );
+});
+
+test('a login that times out is not retried, since each attempt can text a 2FA code', async (t) => {
+  const hive = stubHive({
+    login: async () => {
+      throw new HiveTimeoutError('Hive login', 15_000);
+    },
+  });
+  const { log } = launch(t);
+
+  await h.until(() => log.messages('error').length > 0);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(hive.login.mock.callCount(), 1);
+  assert.match(log.messages('error')[0], /Hive login timed out.*restart Homebridge/);
+});
+
+test('a 2FA code that could not be submitted is not retried with a fresh login', async (t) => {
+  const hive = stubHive({
+    login: async () => {
+      throw new (require('../dist/hiveAuth').HiveSmsRequired)();
+    },
+  });
+  mock.method(HiveAuth.prototype, 'submitSms', async () => {
+    throw networkError();
+  });
+  const { log } = launch(t, { config: { smsCode: '123456' } });
+
+  await h.until(() => log.messages('error').length > 0);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(hive.login.mock.callCount(), 1);
+  assert.match(log.messages('error')[0], /could not submit the 2FA code/);
+});
+
+test('without credentials, cached accessories still report No Response', async (t) => {
+  stubHive();
+  const cached = new (h.createHomebridge().platformAccessory)(
+    'Downstairs',
+    hap.uuid.generate('hive-heating-zone-1'),
+  );
+  cached.context.hiveId = 'zone-1';
+  launch(t, { cached: [cached], config: { password: '' } });
+
+  await assert.rejects(
+    characteristic(cached, hap.Characteristic.CurrentTemperature).handleGetRequest(),
+    (status) => status === COMMUNICATION_FAILURE,
+  );
+});
+
+test('a product missing from a successful poll is reported unreachable', async (t) => {
+  const hive = stubHive();
+  const { platform, homebridge } = launch(t, { stored: { refreshToken: 'stored' } });
+  await h.until(discovered(homebridge));
+  const temperature = characteristic(heatingAccessory(homebridge), hap.Characteristic.CurrentTemperature);
+
+  hive.getState.mock.mockImplementation(async () => ({ zones: [], hotWater: [h.hotWater()] }));
+  await platform.pollOnce();
+
+  await assert.rejects(temperature.handleGetRequest(), (status) => status === COMMUNICATION_FAILURE);
 });
