@@ -385,7 +385,7 @@ Two tools do this now:
   conformance, what matter.js's own command implementations hand back to the
   plugin, echo handling, reachability, and a restart from cache. It imports
   Homebridge internals, so it is not part of `npm test`; CI runs it against
-  each regime's release (2.2.1, 2.3.1, 2.4.0). Locally:
+  each regime's release (2.2.1, 2.3.1, 2.4.0) and the newest (2.5.0). Locally:
   `npm run build && node scripts/verify-matter.mjs`, with `HOMEBRIDGE_MODULES`
   pointing at another install to target another release.
 
