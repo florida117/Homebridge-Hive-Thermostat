@@ -42,7 +42,14 @@ import {
   isTransientAuthError,
 } from './hiveAuth';
 import { HiveTimeoutError } from './timeout';
-import { HiveApi, HiveHeatingZone, HiveMode, HiveState, TokenExpiredError } from './hiveApi';
+import {
+  HiveApi,
+  HiveHeatingType,
+  HiveHeatingZone,
+  HiveMode,
+  HiveState,
+  TokenExpiredError,
+} from './hiveApi';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
 import { HiveMatterPlatform } from './matterPlatform';
@@ -134,9 +141,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         this.homebridgeApi,
         this.log,
         {
-          setHeatingMode: (id, mode) => this.setHeatingMode(id, mode),
-          setHeatingTarget: (id, temp, current) =>
-            this.setHeatingTarget(id, temp, current),
+          setHeatingMode: (zone, mode) => this.setHeatingMode(zone, mode),
+          setHeatingTarget: (zone, temp) => this.setHeatingTarget(zone, temp),
           setHotWaterBoost: (id, minutes) => this.setHotWaterBoost(id, minutes),
           cancelHotWaterBoost: (id, returnTo) =>
             this.cancelHotWaterBoost(id, returnTo),
@@ -392,7 +398,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         continue;
       }
       if (accessory.UUID === this.heatingUuid(id)) {
-        this.handlers.set(id, new HiveHeatingAccessory(this, accessory, id));
+        this.handlers.set(
+          id,
+          new HiveHeatingAccessory(this, accessory, id, heatingTypeOf(accessory)),
+        );
       } else if (accessory.UUID === this.hotWaterUuid(id)) {
         this.handlers.set(
           id,
@@ -418,11 +427,13 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
 
     for (const zone of state.zones) {
-      this.registerHeating(zone.id, zone.name);
+      this.registerHeating(zone);
+      const valve = zone.type === 'trvcontrol';
       this.log.info(
-        `Discovered heating zone "${zone.name}" ` +
+        `Discovered ${valve ? 'radiator valve' : 'heating zone'} "${zone.name}" ` +
           `(current ${zone.currentTemperature}°C, target ${zone.targetTemperature}°C, ` +
           `mode ${zone.mode}${zone.boosting ? ', boosting' : ''}` +
+          `${zone.battery !== undefined ? `, battery ${zone.battery}%` : ''}` +
           `${zone.online ? '' : ', OFFLINE'}).`,
       );
     }
@@ -437,7 +448,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
     if (state.zones.length === 0 && state.hotWater.length === 0) {
       this.log.warn(
-        'Hive: no heating zones or hot water found on this account. ' +
+        'Hive: no heating zones, radiator valves or hot water found on this account. ' +
           'If you expected devices here, please open a GitHub issue with your ' +
           'Homebridge log.',
       );
@@ -485,10 +496,17 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     this.discovered = true;
   }
 
-  private registerHeating(id: string, name: string): void {
-    const accessory = this.platformAccessory(this.heatingUuid(id), id, name);
+  /**
+   * Heating zones and radiator valves share a handler and a UUID namespace —
+   * Hive product ids are unique across both. The product type is kept in the
+   * accessory's context so a cached accessory is rebuilt as the right kind
+   * before Hive has answered.
+   */
+  private registerHeating(zone: HiveHeatingZone): void {
+    const { id, name, type } = zone;
+    const accessory = this.platformAccessory(this.heatingUuid(id), id, name, { hiveType: type });
     if (!(this.handlers.get(id) instanceof HiveHeatingAccessory)) {
-      this.handlers.set(id, new HiveHeatingAccessory(this, accessory, id));
+      this.handlers.set(id, new HiveHeatingAccessory(this, accessory, id, type));
     }
   }
 
@@ -502,19 +520,33 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  /** The cached accessory for `uuid`, registering a new one if there is none. */
-  private platformAccessory(uuid: string, id: string, name: string): PlatformAccessory {
+  /**
+   * The cached accessory for `uuid`, registering a new one if there is none.
+   * `context` is stored alongside the Hive id and kept up to date.
+   */
+  private platformAccessory(
+    uuid: string,
+    id: string,
+    name: string,
+    context: Record<string, string> = {},
+  ): PlatformAccessory {
     let accessory = this.accessories.find((a) => a.UUID === uuid);
     if (!accessory) {
       accessory = new this.homebridgeApi.platformAccessory(name, uuid);
-      accessory.context.hiveId = id;
+      Object.assign(accessory.context, context, { hiveId: id });
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       // configureAccessory() only fires for accessories restored from cache, so
       // newly created ones have to be tracked here.
       this.accessories.push(accessory);
-    } else if (accessory.displayName !== name) {
-      // Keep the cached accessory's name in sync if Hive's name changed.
+      return accessory;
+    }
+    const contextChanged = Object.entries(context).some(
+      ([key, value]) => accessory!.context[key] !== value,
+    );
+    if (accessory.displayName !== name || contextChanged) {
+      // Keep the cached accessory in sync with Hive's name and our context.
       accessory.displayName = name;
+      Object.assign(accessory.context, context);
       this.homebridgeApi.updatePlatformAccessories([accessory]);
     }
     return accessory;
@@ -635,13 +667,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   // Accessories and the Matter layer go through these rather than HiveApi
   // directly, so every write gets the same expired-token recovery.
 
-  setHeatingMode(id: string, mode: HiveMode): Promise<void> {
-    return this.command((api) => api.setHeatingMode(id, mode));
+  /** `zone` is the zone's latest state, which says which node to write. */
+  setHeatingMode(zone: HiveHeatingZone, mode: HiveMode): Promise<void> {
+    return this.command((api) => api.setHeatingMode(zone, mode));
   }
 
-  /** `current` is the zone's latest state; see HiveApi.setHeatingTarget(). */
-  setHeatingTarget(id: string, temp: number, current?: HiveHeatingZone): Promise<void> {
-    return this.command((api) => api.setHeatingTarget(id, temp, current));
+  /** `zone` is the zone's latest state; see HiveApi.setHeatingTarget(). */
+  setHeatingTarget(zone: HiveHeatingZone, temp: number): Promise<void> {
+    return this.command((api) => api.setHeatingTarget(zone, temp));
   }
 
   setHotWaterBoost(id: string, minutes: number): Promise<void> {
@@ -753,6 +786,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       return false;
     }
   }
+}
+
+/**
+ * The Hive product type recorded on a heating accessory. Accessories cached
+ * before radiator valves were supported carry none, and are all heating zones.
+ */
+function heatingTypeOf(accessory: PlatformAccessory): HiveHeatingType {
+  return accessory.context.hiveType === 'trvcontrol' ? 'trvcontrol' : 'heating';
 }
 
 /** Email addresses compare case-insensitively, and config fields pick up stray spaces. */

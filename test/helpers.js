@@ -230,14 +230,19 @@ function createMatter({ regime = '2.4', rejects = () => false } = {}) {
 /** The Hive commands the Matter layer issues, recorded. */
 function recordCommands() {
   const sent = [];
+  /** The zone state each heating command was given, in order. */
+  const zones = [];
   return {
     sent,
+    zones,
     commands: {
-      setHeatingMode: async (id, mode) => {
-        sent.push(['setHeatingMode', id, mode]);
+      setHeatingMode: async (zone, mode) => {
+        zones.push(zone);
+        sent.push(['setHeatingMode', zone.id, mode]);
       },
-      setHeatingTarget: async (id, temp, current) => {
-        sent.push(['setHeatingTarget', id, temp, current?.mode]);
+      setHeatingTarget: async (zone, temp) => {
+        zones.push(zone);
+        sent.push(['setHeatingTarget', zone.id, temp, zone.mode]);
       },
       setHotWaterBoost: async (id, minutes) => {
         sent.push(['setHotWaterBoost', id, minutes]);
@@ -265,6 +270,17 @@ function zone(overrides = {}) {
   };
 }
 
+/** A room of Hive radiator valves, as HiveApi normalises it. */
+function radiatorValve(overrides = {}) {
+  return zone({
+    id: 'trv-room-1',
+    type: 'trvcontrol',
+    name: 'Bedroom',
+    battery: 80,
+    ...overrides,
+  });
+}
+
 function hotWater(overrides = {}) {
   return {
     id: 'hw-1',
@@ -288,5 +304,6 @@ module.exports = {
   createMatter,
   recordCommands,
   zone,
+  radiatorValve,
   hotWater,
 };

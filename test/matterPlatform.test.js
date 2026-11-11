@@ -31,7 +31,7 @@ async function setup({
 } = {}) {
   const fake = h.createMatter({ regime, rejects });
   const log = h.createLog();
-  const { sent, commands } = h.recordCommands();
+  const { sent, zones: commanded, commands } = h.recordCommands();
   const platform = new HiveMatterPlatform(
     { isMatterEnabled: () => true, matter: fake.matter },
     log,
@@ -55,7 +55,7 @@ async function setup({
     await h.settle();
   }
   sent.length = 0;
-  return { fake, log, sent, platform };
+  return { fake, log, sent, commanded, platform };
 }
 
 /** An accessory as Homebridge restores it from its cache, state and all. */
@@ -291,4 +291,25 @@ test('a thermostat that does not come online is retried with the other Presets c
   assert.deepEqual(fake.calls.unregistered, [HEATING]);
   assert.ok(fake.endpoints.has(HEATING));
   assert.ok(log.messages('info').some((m) => m.includes('online with Presets=true')));
+});
+
+// ---- Radiator valves --------------------------------------------------------
+
+test('a radiator valve room is a Matter thermostat whose commands carry its product type', async () => {
+  const valve = h.radiatorValve();
+  const uuid = 'hive-matter-heating-trv-room-1';
+  const { fake, sent, commanded } = await setup({ zones: [h.zone(), valve] });
+
+  assert.equal(fake.endpoints.get(uuid).accessory.model, 'Radiator Valve');
+  assert.equal(fake.endpoints.get(HEATING).accessory.model, 'Heating Zone');
+  assert.equal(fake.state(uuid).occupiedHeatingSetpoint, 2000);
+
+  await fake.controllerWrite(uuid, { occupiedHeatingSetpoint: 2150 });
+  await fake.controllerWrite(uuid, { systemMode: SystemMode.Off });
+
+  assert.deepEqual(sent, [
+    ['setHeatingTarget', 'trv-room-1', 21.5, 'SCHEDULE'],
+    ['setHeatingMode', 'trv-room-1', 'OFF'],
+  ]);
+  assert.deepEqual(commanded.map((z) => z.type), ['trvcontrol', 'trvcontrol']);
 });

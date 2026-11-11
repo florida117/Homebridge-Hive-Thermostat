@@ -1,8 +1,8 @@
 {
   "displayName": "Homebridge Hive Thermostat",
   "name": "homebridge-hive-thermostat",
-  "version": "1.1.1",
-  "description": "Homebridge plugin exposing Hive heating zones and hot water to HomeKit via the Hive cloud API (Cognito SRP auth with SMS 2FA).",
+  "version": "1.2.0",
+  "description": "Homebridge plugin exposing Hive heating zones, radiator valves and hot water to HomeKit via the Hive cloud API (Cognito SRP auth with SMS 2FA).",
   "license": "MIT",
   "author": "Kurtis Bell",
   "repository": {
@@ -39,6 +39,8 @@
     "thermostat",
     "heating",
     "hot-water",
+    "trv",
+    "radiator-valve",
     "homekit"
   ],
   "dependencies": {

@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] - 2026-11-11
+
+### Added
+- **Hive radiator valves (TRVs).** Each room of radiator valves appears as its
+  own thermostat, with the same controls as a heating zone — off, heat
+  (manual) and schedule (Auto), current and target temperature, and whether
+  the valve is calling for heat. Over HomeKit it also shows the battery level,
+  with a low-battery warning at 20% or below; a room with several valves shows
+  the lowest. Over Matter, radiator valves are thermostats too.
+- A room of radiator valves shows No Response only when all of its valves are
+  offline, so one valve dropping off does not hide the room.
+
 ## [1.1.1] - 2026-10-31
 
 **Follow-up fixes to 1.1.0.**

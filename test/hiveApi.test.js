@@ -93,14 +93,12 @@ test('a 401 is reported as an expired token', async () => {
 test('a new target keeps a scheduled zone on its schedule', async () => {
   const requests = mockFetch(() => ({}));
 
-  await api().setHeatingTarget('z1', 21, h.zone({ mode: 'SCHEDULE' }));
-  await api().setHeatingTarget('z1', 21, h.zone({ mode: 'SCHEDULE', boosting: true }));
-  await api().setHeatingTarget('z1', 21, h.zone({ mode: 'OFF' }));
-  await api().setHeatingTarget('z1', 21);
+  await api().setHeatingTarget(h.zone({ mode: 'SCHEDULE' }), 21);
+  await api().setHeatingTarget(h.zone({ mode: 'SCHEDULE', boosting: true }), 21);
+  await api().setHeatingTarget(h.zone({ mode: 'OFF' }), 21);
 
   assert.deepEqual(requests.map((r) => JSON.parse(r.body)), [
     { target: 21 },
-    { mode: 'MANUAL', target: 21 },
     { mode: 'MANUAL', target: 21 },
     { mode: 'MANUAL', target: 21 },
   ]);
@@ -108,13 +106,108 @@ test('a new target keeps a scheduled zone on its schedule', async () => {
 
 test('a write falls through to the regional host only on a gateway rejection', async () => {
   let requests = mockFetch((url) => (url.includes('beekeeper-uk') ? {} : { status: 403 }));
-  await api().setHeatingMode('z1', 'OFF');
+  await api().setHeatingMode(h.zone({ id: 'z1' }), 'OFF');
   assert.deepEqual(requests.map((r) => new URL(r.url).host), [
     'beekeeper.hivehome.com',
     'beekeeper-uk.hivehome.com',
   ]);
 
   requests = mockFetch(() => ({ status: 400, body: 'bad   request' }));
-  await assert.rejects(api().setHeatingMode('z1', 'OFF'), /HTTP 400 bad request/);
+  await assert.rejects(api().setHeatingMode(h.zone({ id: 'z1' }), 'OFF'), /HTTP 400 bad request/);
   assert.equal(requests.length, 1);
+});
+
+// ---- Radiator valves ------------------------------------------------------
+//
+// Payload shapes follow pyhiveapi's captured Hive data (src/data/data.json):
+// a `trvcontrol` product per room, parented to the hub, listing its `trv`
+// devices in props.trvs.
+
+function trvRoom(overrides = {}) {
+  return {
+    id: 'r1',
+    type: 'trvcontrol',
+    parent: 'hub1',
+    props: { online: true, temperature: 17.6, working: true, trvs: ['v1'], previous: {} },
+    state: { name: 'Bedroom', mode: 'SCHEDULE', target: 19 },
+    ...overrides,
+  };
+}
+
+function trv(id, props = {}) {
+  return { id, type: 'trv', parent: 'hub1', props: { online: true, power: 'battery', battery: 40, ...props } };
+}
+
+test('parses a radiator valve room as a heating zone with a battery level', async () => {
+  mockFetch(() => nodes([trvRoom()], [{ id: 'hub1', props: { online: true } }, trv('v1')]));
+
+  const { zones } = await api().getState();
+
+  assert.deepEqual(zones, [{
+    id: 'r1',
+    type: 'trvcontrol',
+    name: 'Bedroom',
+    online: true,
+    currentTemperature: 17.6,
+    targetTemperature: 19,
+    mode: 'SCHEDULE',
+    boosting: false,
+    heating: true,
+    battery: 40,
+  }]);
+});
+
+test('a radiator valve room is online while any of its valves is, never by the hub', async () => {
+  const rooms = [
+    trvRoom({ id: 'one-down', props: { ...trvRoom().props, trvs: ['up', 'down'] } }),
+    trvRoom({ id: 'all-down', props: { ...trvRoom().props, trvs: ['down'] } }),
+    trvRoom({ id: 'product-down', props: { ...trvRoom().props, online: false, trvs: ['up'] } }),
+  ];
+  mockFetch(() => nodes(rooms, [
+    // The hub being offline says nothing about the valves.
+    { id: 'hub1', props: { online: false } },
+    trv('up'),
+    trv('down', { online: false }),
+  ]));
+
+  const { zones } = await api().getState();
+
+  assert.deepEqual(zones.map((z) => [z.id, z.online]), [
+    ['one-down', true],
+    ['all-down', false],
+    ['product-down', false],
+  ]);
+});
+
+test('a radiator valve room reports its lowest real battery reading', async () => {
+  const rooms = [
+    trvRoom({ id: 'two', props: { ...trvRoom().props, trvs: ['a', 'b'] } }),
+    trvRoom({ id: 'none', props: { ...trvRoom().props, trvs: ['c', 'missing'] } }),
+  ];
+  mockFetch(() => nodes(rooms, [
+    trv('a', { battery: 60 }),
+    trv('b', { battery: 15 }),
+    trv('c', { battery: null }),
+  ]));
+
+  const { zones } = await api().getState();
+
+  assert.equal(zones[0].battery, 15);
+  // A null is no reading, not 0% — and no reading means no battery field.
+  assert.ok(!('battery' in zones[1]));
+});
+
+test('radiator valve writes go to the trvcontrol node', async () => {
+  const requests = mockFetch(() => ({}));
+  const room = h.radiatorValve({ id: 'r1', mode: 'MANUAL' });
+
+  await api().setHeatingTarget(room, 21);
+  await api().setHeatingMode(room, 'OFF');
+  await api().setHeatingMode(h.zone({ id: 'z1' }), 'OFF');
+
+  assert.deepEqual(requests.map((r) => [new URL(r.url).pathname, JSON.parse(r.body)]), [
+    ['/1.0/nodes/trvcontrol/r1', { mode: 'MANUAL', target: 21 }],
+    ['/1.0/nodes/trvcontrol/r1', { mode: 'OFF' }],
+    ['/1.0/nodes/heating/z1', { mode: 'OFF' }],
+  ]);
 });

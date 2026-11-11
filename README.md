@@ -6,7 +6,7 @@
 
 [![verified-by-homebridge](https://img.shields.io/badge/_-verified-blueviolet?color=%23491F59&style=flat&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
 
-A Homebridge plugin that exposes **Hive heating zones and hot water** to Apple HomeKit, talking directly to the Hive cloud API.
+A Homebridge plugin that exposes **Hive heating zones, radiator valves and hot water** to Apple HomeKit, talking directly to the Hive cloud API.
 
 It was written as a modern replacement for older Hive plugins that broke when Hive moved to AWS Cognito authentication with mandatory SMS two-factor auth. Authentication, token refresh, and the 2FA handshake are all handled here.
 
@@ -34,10 +34,11 @@ setup prefers.
 
 ## Features
 
-- Auto-discovers all heating zones and hot water controls on your account
+- Auto-discovers all heating zones, radiator valves and hot water controls on your account
 - Each heating zone exposed as a HomeKit **Thermostat** (current temp, target temp, off / heat / schedule)
+- Each room of Hive **radiator valves** (TRVs) exposed as its own **Thermostat**, with the same controls plus a **battery level** and low-battery warning
 - Hot water exposed as a **Switch** with a timed boost (like homebridge-nest): flip it on to run hot water for a configurable number of minutes, flip it off to cancel
-- Optional Homebridge v2 **Matter** support: heating zones are also exposed as Matter Thermostats and hot water boosts as Matter On/Off Outlets
+- Optional Homebridge v2 **Matter** support: heating zones and radiator valves are also exposed as Matter Thermostats and hot water boosts as Matter On/Off Outlets
 - Reports **No Response** in the Home app when Hive marks a device offline, or when Hive itself stops answering, rather than showing stale data (Matter controllers see the device as unreachable)
 - One-time SMS 2FA during setup, then silent token refresh — no repeated SMS prompts
 - Keeps retrying sign-in if Homebridge starts before your network does (after a power cut, say), instead of waiting for a restart
@@ -55,6 +56,9 @@ setup prefers.
 
 During a boost started from the Hive app, the zone shows the mode it will
 return to when the boost ends.
+
+Radiator valves use the same mapping: each valve room has its own mode,
+target and schedule in Hive, separate from the heating zone it sits in.
 
 Changing the temperature while a zone is in **Auto** keeps it on its schedule:
 Hive treats the new temperature as an override until the next scheduled
@@ -142,7 +146,8 @@ To use it:
 Matter support is intentionally limited to the device types that map cleanly to
 Hive:
 
-- Heating zones become Matter Thermostats.
+- Heating zones and radiator valve rooms become Matter Thermostats. Battery
+  level is shown over HomeKit only.
 - Hot water becomes a Matter On/Off Outlet for manual boost control.
 - Hive schedules are not edited through Matter; Schedule maps to Matter Auto.
 

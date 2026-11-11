@@ -8,8 +8,8 @@ type MatterApiHost = {
 };
 
 type HiveMatterCommands = {
-  setHeatingMode(id: string, mode: HiveMode): Promise<void>;
-  setHeatingTarget(id: string, temp: number, current?: HiveHeatingZone): Promise<void>;
+  setHeatingMode(zone: HiveHeatingZone, mode: HiveMode): Promise<void>;
+  setHeatingTarget(zone: HiveHeatingZone, temp: number): Promise<void>;
   setHotWaterBoost(id: string, minutes: number): Promise<void>;
   cancelHotWaterBoost(id: string, returnTo?: HiveMode): Promise<void>;
   pollSoon(delayMs?: number): void;
@@ -688,7 +688,9 @@ export class HiveMatterPlatform {
       // to the Hive schedule — see matterModeFromHive()/hiveModeFromMatter().
       deviceType: this.thermostat!.deviceType,
       manufacturer: 'Hive',
-      model: 'Heating Zone',
+      // A radiator valve room is the same thermostat to Matter; only the model
+      // tells them apart.
+      model: zone.type === 'trvcontrol' ? 'Radiator Valve' : 'Heating Zone',
       serialNumber: this.serialNumber(zone.id),
       context: { hiveId: zone.id, kind: 'heating' },
       clusters: {
@@ -700,7 +702,10 @@ export class HiveMatterPlatform {
             if (this.isEcho(this.heatingUuid(zone.id), 'systemMode', systemMode)) {
               return;
             }
-            await this.commands.setHeatingMode(zone.id, this.hiveModeFromMatter(systemMode));
+            await this.commands.setHeatingMode(
+              this.currentZone(zone),
+              this.hiveModeFromMatter(systemMode),
+            );
             this.commands.pollSoon();
           },
           occupiedHeatingSetpointChange: async ({ occupiedHeatingSetpoint }) => {
@@ -719,9 +724,8 @@ export class HiveMatterPlatform {
               return;
             }
             await this.commands.setHeatingTarget(
-              zone.id,
-              occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
               this.currentZone(zone),
+              occupiedHeatingSetpoint / CELSIUS_TO_MATTER,
             );
             this.commands.pollSoon();
           },
@@ -763,7 +767,7 @@ export class HiveMatterPlatform {
               HIVE_MAX_TEMP,
               Math.max(HIVE_MIN_TEMP, current.targetTemperature + amount / 10),
             );
-            await this.commands.setHeatingTarget(zone.id, target, current);
+            await this.commands.setHeatingTarget(current, target);
             this.commands.pollSoon();
           },
         },
