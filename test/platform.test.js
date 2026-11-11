@@ -305,3 +305,104 @@ test('a product missing from a successful poll is reported unreachable', async (
 
   await assert.rejects(temperature.handleGetRequest(), (status) => status === COMMUNICATION_FAILURE);
 });
+
+// ---- Radiator valves --------------------------------------------------------
+
+function valveAccessory(homebridge, accessories = homebridge.registered) {
+  const uuid = hap.uuid.generate('hive-heating-trv-room-1');
+  return accessories.find((a) => a.UUID === uuid);
+}
+
+function battery(accessory, type) {
+  return accessory.getService(hap.Service.Battery).getCharacteristic(type);
+}
+
+test('a radiator valve room is a thermostat with a battery, written to its own node', async (t) => {
+  stubHive({
+    getState: async () => ({ zones: [h.zone(), h.radiatorValve({ battery: 15 })], hotWater: [] }),
+  });
+  const writes = [];
+  globalThis.fetch = async (url, init) => {
+    writes.push([new URL(url).pathname, JSON.parse(init.body)]);
+    return new Response('{}', { status: 200 });
+  };
+  const { homebridge, log } = launch(t, { stored: { refreshToken: 'stored' } });
+  await h.until(discovered(homebridge));
+  const valve = valveAccessory(homebridge);
+
+  assert.equal(valve.context.hiveType, 'trvcontrol');
+  assert.equal(
+    valve.getService(hap.Service.AccessoryInformation).getCharacteristic(hap.Characteristic.Model).value,
+    'Radiator Valve',
+  );
+  assert.equal(await battery(valve, hap.Characteristic.BatteryLevel).handleGetRequest(), 15);
+  assert.equal(
+    await battery(valve, hap.Characteristic.StatusLowBattery).handleGetRequest(),
+    hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW,
+  );
+  assert.equal(heatingAccessory(homebridge).getService(hap.Service.Battery), undefined);
+  assert.ok(log.messages('info').some((m) => m.includes('Discovered radiator valve "Bedroom"')));
+
+  await characteristic(valve, hap.Characteristic.TargetTemperature).handleSetRequest(21);
+  await characteristic(valve, hap.Characteristic.TargetHeatingCoolingState)
+    .handleSetRequest(hap.Characteristic.TargetHeatingCoolingState.OFF);
+
+  assert.deepEqual(writes, [
+    ['/1.0/nodes/trvcontrol/trv-room-1', { target: 21 }],
+    ['/1.0/nodes/trvcontrol/trv-room-1', { mode: 'OFF' }],
+  ]);
+});
+
+test('a radiator valve with no battery reading gets no Battery service, rather than a false 0%', async (t) => {
+  const hive = stubHive({
+    getState: async () => ({ zones: [h.zone(), h.radiatorValve({ battery: undefined })], hotWater: [] }),
+  });
+  const { platform, homebridge } = launch(t, { stored: { refreshToken: 'stored' } });
+  await h.until(discovered(homebridge));
+  const valve = valveAccessory(homebridge);
+
+  assert.equal(valve.getService(hap.Service.Battery), undefined);
+
+  hive.getState.mock.mockImplementation(async () => ({
+    zones: [h.zone(), h.radiatorValve({ battery: 70 })],
+    hotWater: [],
+  }));
+  await platform.pollOnce();
+  assert.equal(await battery(valve, hap.Characteristic.BatteryLevel).handleGetRequest(), 70);
+
+  // A later poll without a reading keeps the last real one.
+  hive.getState.mock.mockImplementation(async () => ({
+    zones: [h.zone(), h.radiatorValve({ battery: undefined })],
+    hotWater: [],
+  }));
+  await platform.pollOnce();
+  assert.equal(await battery(valve, hap.Characteristic.BatteryLevel).handleGetRequest(), 70);
+  assert.equal(
+    await battery(valve, hap.Characteristic.StatusLowBattery).handleGetRequest(),
+    hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
+  );
+});
+
+test('a cached radiator valve is reused as one, keeping its Battery service and node', async (t) => {
+  stubHive({
+    getState: async () => ({ zones: [h.radiatorValve()], hotWater: [] }),
+  });
+  const writes = [];
+  globalThis.fetch = async (url) => {
+    writes.push(new URL(url).pathname);
+    return new Response('{}', { status: 200 });
+  };
+  const cached = new (h.createHomebridge().platformAccessory)(
+    'Bedroom',
+    hap.uuid.generate('hive-heating-trv-room-1'),
+  );
+  Object.assign(cached.context, { hiveId: 'trv-room-1', hiveType: 'trvcontrol' });
+  cached.addService(hap.Service.Battery);
+  const { homebridge, log } = launch(t, { stored: { refreshToken: 'stored' }, cached: [cached] });
+  await h.until(() => log.messages('info').some((m) => m.includes('Discovered radiator valve')));
+
+  assert.equal(homebridge.registered.length, 0, 'the cached accessory is reused');
+  assert.equal(await battery(cached, hap.Characteristic.BatteryLevel).handleGetRequest(), 80);
+  await characteristic(cached, hap.Characteristic.TargetTemperature).handleSetRequest(21);
+  assert.deepEqual(writes, ['/1.0/nodes/trvcontrol/trv-room-1']);
+});

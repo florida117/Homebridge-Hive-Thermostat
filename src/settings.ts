@@ -48,3 +48,9 @@ export const STARTUP_RETRY_MAX_MS = 30 * 60_000;
 export const HIVE_MIN_TEMP = 5;
 export const HIVE_MAX_TEMP = 32;
 export const HIVE_TEMP_STEP = 0.5;
+
+/**
+ * Battery level (percent) at or below which a radiator valve reports low
+ * battery to HomeKit.
+ */
+export const TRV_LOW_BATTERY_PERCENT = 20;

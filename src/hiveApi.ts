@@ -2,7 +2,8 @@
  * HiveApi — thin client over Hive's beekeeper API.
  *
  * Responsibilities:
- *   - GET /nodes/all  → parse heating zones + hot water into a normalised shape
+ *   - GET /nodes/all  → parse heating zones, radiator valves and hot water into
+ *     a normalised shape
  *   - POST /nodes/{type}/{id} → write mode / target temperature / boost
  *
  * Auth is via the Cognito IdToken in the `authorization` header. Token refresh
@@ -27,9 +28,16 @@ const WRITE_BASES: readonly string[] = [
   ...new Set([HIVE_URLS.beekeeperBase, HIVE_URLS.beekeeperWriteBase]),
 ];
 
+/**
+ * The Hive products that are driven as a heating zone: a boiler zone
+ * (`heating`), or a room of radiator valves (`trvcontrol`). Both take the same
+ * mode and target writes; the type is the node path they are written to.
+ */
+export type HiveHeatingType = 'heating' | 'trvcontrol';
+
 export interface HiveHeatingZone {
   id: string;
-  type: 'heating';
+  type: HiveHeatingType;
   name: string;
   online: boolean;
   currentTemperature: number;
@@ -38,8 +46,17 @@ export interface HiveHeatingZone {
   mode: HiveMode;
   /** Whether a boost is currently active. */
   boosting: boolean;
-  /** Whether the boiler is actively calling for heat right now. */
+  /**
+   * Whether the zone is calling for heat right now — the boiler for a heating
+   * zone, the valve for a radiator valve.
+   */
   heating: boolean;
+  /**
+   * Radiator valves only: the lowest battery level, in percent, among the
+   * room's valves that report one. Absent for heating zones, and for a room
+   * whose valves report none.
+   */
+  battery?: number;
 }
 
 export interface HiveHotWater {
@@ -95,17 +112,17 @@ export class HiveApi {
     const devices: any[] = body.devices ?? [];
 
     // Online status lives on the physical device, not the product. Build a
-    // lookup of deviceId -> online, so a product can resolve it via `parent`.
-    const onlineByDevice = new Map<string, boolean>();
+    // lookup of deviceId -> device, so a product can resolve it via `parent`.
+    const deviceById = new Map<string, any>();
     for (const d of devices) {
-      onlineByDevice.set(d.id, d.props?.online !== false);
+      deviceById.set(d.id, d);
     }
 
     const resolveOnline = (p: any): boolean => {
       // A product's `parent` is the device id. Fall back to true if unknown
       // rather than wrongly flagging No Response.
-      if (p.parent && onlineByDevice.has(p.parent)) {
-        return onlineByDevice.get(p.parent)!;
+      if (p.parent && deviceById.has(p.parent)) {
+        return deviceById.get(p.parent).props?.online !== false;
       }
       return true;
     };
@@ -116,6 +133,8 @@ export class HiveApi {
     for (const p of products) {
       if (p.type === 'heating') {
         zones.push(this.parseHeating(p, resolveOnline(p)));
+      } else if (p.type === 'trvcontrol') {
+        zones.push(this.parseRadiatorValve(p, deviceById));
       } else if (p.type === 'hotwater') {
         hotWater.push(this.parseHotWater(p, resolveOnline(p)));
       }
@@ -143,6 +162,43 @@ export class HiveApi {
       mode,
       boosting,
       heating: props.working === true,
+    };
+  }
+
+  /**
+   * A radiator valve room. Hive models it as a `trvcontrol` product — the
+   * room's schedule, mode and target, shaped exactly like a heating zone —
+   * driving one or more `trv` devices, listed in `props.trvs`.
+   *
+   * The product's `parent` is the hub, not a valve, so the heating zone's
+   * parent lookup would report the hub's status. Online status comes from the
+   * valves instead: the room is controllable while any of its valves is, and
+   * offline when Hive marks the product itself offline. Battery is the lowest
+   * any valve reports, since that is the one that needs changing first.
+   */
+  private parseRadiatorValve(p: any, deviceById: Map<string, any>): HiveHeatingZone {
+    const props = p.props ?? {};
+    const valveIds: unknown[] = Array.isArray(props.trvs) ? props.trvs : [];
+    const valves = valveIds
+      .map((id) => deviceById.get(id as string))
+      .filter((d) => d !== undefined);
+
+    const online =
+      props.online !== false &&
+      (valves.length === 0 || valves.some((d) => d.props?.online !== false));
+
+    // Only real readings: a null coerced to 0 would raise a false low-battery
+    // alert.
+    const levels: number[] = valves
+      .map((d) => d.props?.battery)
+      .filter((level): level is number =>
+        typeof level === 'number' && Number.isFinite(level) && level >= 0 && level <= 100);
+
+    return {
+      ...this.parseHeating(p, online),
+      type: 'trvcontrol',
+      name: p.state?.name ?? props.zoneName ?? 'Radiator Valve',
+      ...(levels.length ? { battery: Math.min(...levels) } : {}),
     };
   }
 
@@ -175,7 +231,7 @@ export class HiveApi {
 
   /** POST a state change to a node. */
   private async setNodeState(
-    type: 'heating' | 'hotwater',
+    type: HiveHeatingType | 'hotwater',
     id: string,
     payload: Record<string, string | number>,
   ): Promise<void> {
@@ -226,18 +282,21 @@ export class HiveApi {
    * scheduled change. Anywhere else a new target means "heat to this now",
    * which is MANUAL. A boosting zone keeps that MANUAL behaviour too: what a
    * bare target does to a running boost has not been established.
+   *
+   * The zone's type picks the node written to, so the same call serves heating
+   * zones and radiator valves.
    */
-  setHeatingTarget(id: string, temp: number, current?: HiveHeatingZone): Promise<void> {
-    const onSchedule = current?.mode === 'SCHEDULE' && !current.boosting;
+  setHeatingTarget(zone: HiveHeatingZone, temp: number): Promise<void> {
+    const onSchedule = zone.mode === 'SCHEDULE' && !zone.boosting;
     return this.setNodeState(
-      'heating',
-      id,
+      zone.type,
+      zone.id,
       onSchedule ? { target: temp } : { mode: 'MANUAL', target: temp },
     );
   }
 
-  setHeatingMode(id: string, mode: HiveMode): Promise<void> {
-    return this.setNodeState('heating', id, { mode });
+  setHeatingMode(zone: HiveHeatingZone, mode: HiveMode): Promise<void> {
+    return this.setNodeState(zone.type, zone.id, { mode });
   }
 
   setHotWaterMode(id: string, mode: HiveMode): Promise<void> {

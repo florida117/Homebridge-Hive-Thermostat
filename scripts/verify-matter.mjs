@@ -63,8 +63,13 @@ const hotWater = (overrides = {}) => ({
   id: 'hw1', type: 'hotwater', name: 'Hot Water', online: true, mode: 'SCHEDULE',
   on: false, boosting: false, ...overrides,
 });
-const state = { zones: [zone()], hotWater: [hotWater()] };
+// A room of radiator valves is a second thermostat, written to its own node.
+const valve = (overrides = {}) => zone({
+  id: 'room1', type: 'trvcontrol', name: 'Bedroom', battery: 80, ...overrides,
+});
+const state = { zones: [zone(), valve()], hotWater: [hotWater()] };
 const HEATING = hap.uuid.generate('hive-matter-heating-zone1');
+const VALVE = hap.uuid.generate('hive-matter-heating-room1');
 const HOT_WATER = hap.uuid.generate('hive-matter-hotwater-hw1');
 
 const homebridgeErrors = [];
@@ -114,8 +119,9 @@ async function boot() {
 
   const sent = [];
   const commands = {
-    setHeatingMode: async (_id, mode) => sent.push(`mode ${mode}`),
-    setHeatingTarget: async (_id, temp) => sent.push(`target ${temp}`),
+    // Commands for anything but a boiler zone are tagged with the node they write.
+    setHeatingMode: async (z, mode) => sent.push(`${node(z)}mode ${mode}`),
+    setHeatingTarget: async (z, temp) => sent.push(`${node(z)}target ${temp}`),
     setHotWaterBoost: async () => sent.push('boost'),
     cancelHotWaterBoost: async (_id, mode) => sent.push(`cancel to ${mode}`),
     pollSoon: () => {},
@@ -137,11 +143,13 @@ async function boot() {
   }
   const restored = new Map([...server.accessories].map(([uuid, a]) => [uuid, a.endpoint]));
 
-  await platform.updateHeating(state.zones[0]);
+  for (const z of state.zones) {
+    await platform.updateHeating(z);
+  }
   await platform.updateHotWater(state.hotWater[0]);
   await platform.register(state);
   for (let waited = 0; waited < 20_000; waited += 100) {
-    if ([HEATING, HOT_WATER].every((uuid) => server.accessories.get(uuid)?.endpoint)) {
+    if ([HEATING, VALVE, HOT_WATER].every((uuid) => server.accessories.get(uuid)?.endpoint)) {
       break;
     }
     await sleep(100);
@@ -152,12 +160,15 @@ async function boot() {
   // thermostat occupied when the node goes online, which this node never does.
   // Until then setpoint commands move the *unoccupied* setpoints, so do what
   // going online would.
-  const thermostat = endpoint(HEATING);
-  if (thermostat?.state.thermostat.occupancy !== undefined) {
-    await thermostat.set({ thermostat: { occupancy: { occupied: true } } });
+  for (const thermostat of [endpoint(HEATING), endpoint(VALVE)]) {
+    if (thermostat?.state.thermostat.occupancy !== undefined) {
+      await thermostat.set({ thermostat: { occupancy: { occupied: true } } });
+    }
   }
   return { server, platform, sent, restored, endpoint };
 }
+
+const node = (z) => (z.type === 'heating' ? '' : `${z.type} `);
 
 /** Settle, then return (and clear) what reached "Hive". */
 async function drain(run) {
@@ -171,6 +182,8 @@ try {
   const thermostat = first.endpoint(HEATING);
   check('thermostat comes online', !!thermostat);
   check('hot water comes online', !!first.endpoint(HOT_WATER));
+  const valveEndpoint = first.endpoint(VALVE);
+  check('radiator valve thermostat comes online', !!valveEndpoint);
 
   const raise = (mode, amount) =>
     thermostat.act((agent) => agent.thermostat.setpointRaiseLower({ mode, amount }));
@@ -217,12 +230,23 @@ try {
     `sent ${JSON.stringify(sent)}, heating ${t.occupiedHeatingSetpoint}, cooling ${t.occupiedCoolingSetpoint}`,
   );
 
+  await first.platform.updateHeating(valve());
+  await drain(first);
+  await valveEndpoint?.set({ thermostat: { occupiedHeatingSetpoint: 2150 } });
+  await valveEndpoint?.set({ thermostat: { systemMode: 0 } });
+  sent = await drain(first);
+  check('radiator valve commands reach its own node',
+    sent.join() === 'trvcontrol target 21.5,trvcontrol mode OFF', JSON.stringify(sent));
+  await first.platform.updateHeating(valve({ targetTemperature: 21.5, mode: 'OFF' }));
+  sent = await drain(first);
+  check('a radiator valve poll write is not echoed to Hive', sent.length === 0, JSON.stringify(sent));
+
   await poll({ targetTemperature: 18, online: false });
   check('an offline zone is unreachable', thermostat.state.bridgedDeviceBasicInformation.reachable === false);
   await poll({ targetTemperature: 18 });
   check('a zone back online is reachable', thermostat.state.bridgedDeviceBasicInformation.reachable === true);
 
-  const numbers = new Map([HEATING, HOT_WATER].map((uuid) => [uuid, first.endpoint(uuid)?.number]));
+  const numbers = new Map([HEATING, VALVE, HOT_WATER].map((uuid) => [uuid, first.endpoint(uuid)?.number]));
   await sleep(2500); // let Homebridge persist its accessory cache
   await first.server.stop();
 
@@ -238,9 +262,9 @@ try {
   } else {
     console.log('  (this Homebridge restores nothing from its cache)');
   }
-  check('both endpoints are live after the restart',
-    !!second.endpoint(HEATING) && !!second.endpoint(HOT_WATER));
-  for (const [uuid, name] of [[HEATING, 'thermostat'], [HOT_WATER, 'hot water']]) {
+  check('every endpoint is live after the restart',
+    !!second.endpoint(HEATING) && !!second.endpoint(VALVE) && !!second.endpoint(HOT_WATER));
+  for (const [uuid, name] of [[HEATING, 'thermostat'], [VALVE, 'radiator valve'], [HOT_WATER, 'hot water']]) {
     check(`the ${name} keeps its endpoint number`, second.endpoint(uuid)?.number === numbers.get(uuid),
       `${numbers.get(uuid)} -> ${second.endpoint(uuid)?.number}`);
   }
