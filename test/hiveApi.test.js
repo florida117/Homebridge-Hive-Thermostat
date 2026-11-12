@@ -211,3 +211,92 @@ test('radiator valve writes go to the trvcontrol node', async () => {
     ['/1.0/nodes/heating/z1', { mode: 'OFF' }],
   ]);
 });
+
+// ---- Plugs, lights and sensors -------------------------------------------
+//
+// Shapes from pyhiveapi's captured data: the product and its device share an
+// id, and the product's parent is the hub.
+
+const HUB = { id: 'hub1', props: { online: false } };
+
+test('parses plugs, lights and sensors, taking online status from their own device', async () => {
+  mockFetch(() => nodes(
+    [
+      { id: 'p1', type: 'activeplug', parent: 'hub1', props: { inUse: true }, state: { name: 'Lamp', status: 'ON' } },
+      { id: 'l1', type: 'warmwhitelight', parent: 'hub1', props: {}, state: { name: 'Hall', status: 'OFF', brightness: 40 } },
+      {
+        id: 'l2', type: 'tuneablelight', parent: 'hub1',
+        props: { colourTemperature: { min: 2700, max: 6535 } },
+        state: { name: 'Kitchen', status: 'ON', brightness: 100, colourTemperature: 2703 },
+      },
+      {
+        id: 'l3', type: 'colourtuneablelight', parent: 'hub1',
+        props: { colourTemperature: { min: 2700, max: 6535 } },
+        state: {
+          name: 'Lounge', status: 'ON', brightness: 80, colourMode: 'COLOUR',
+          hue: '45', saturation: 65, value: 100, colourTemperature: 3300,
+        },
+      },
+      {
+        id: 's1', type: 'motionsensor', parent: 'hub1',
+        props: { motion: { status: true }, battery: 80 }, state: { name: 'Landing' },
+      },
+      {
+        id: 's2', type: 'contactsensor', parent: 'hub1',
+        props: { status: 'OPEN', battery: null }, state: { name: 'Back Door' },
+      },
+    ],
+    [
+      HUB,
+      { id: 'p1', props: { online: true } },
+      { id: 'l1', props: { online: false } },
+      { id: 'l2', props: { online: true } },
+      { id: 'l3', props: { online: true } },
+      { id: 's1', props: { online: true, battery: 80 } },
+      { id: 's2', props: { online: true, battery: 40 } },
+    ],
+  ));
+
+  const { plugs, lights, sensors } = await api().getState();
+
+  assert.deepEqual(plugs, [{ id: 'p1', type: 'activeplug', name: 'Lamp', online: true, on: true, inUse: true }]);
+  assert.deepEqual(lights, [
+    { id: 'l1', type: 'warmwhitelight', name: 'Hall', online: false, on: false, brightness: 40 },
+    {
+      id: 'l2', type: 'tuneablelight', name: 'Kitchen', online: true, on: true, brightness: 100,
+      colourTemperatureRange: { min: 2700, max: 6535 }, colourTemperature: 2703,
+    },
+    {
+      id: 'l3', type: 'colourtuneablelight', name: 'Lounge', online: true, on: true, brightness: 80,
+      colourTemperatureRange: { min: 2700, max: 6535 }, colourTemperature: 3300,
+      colourMode: 'COLOUR', hue: 45, saturation: 65,
+    },
+  ]);
+  assert.deepEqual(sensors, [
+    { id: 's1', type: 'motionsensor', name: 'Landing', online: true, triggered: true, battery: 80 },
+    // The product's null battery is no reading; the device's is used instead.
+    { id: 's2', type: 'contactsensor', name: 'Back Door', online: true, triggered: true, battery: 40 },
+  ]);
+});
+
+test('plug and light writes go to their own node with pyhiveapi\'s payloads', async () => {
+  const requests = mockFetch(() => ({}));
+  const tuneable = { id: 'l2', type: 'tuneablelight' };
+  const colour = { id: 'l3', type: 'colourtuneablelight' };
+
+  await api().setPlug('p1', true);
+  await api().setLight(tuneable, { on: false });
+  await api().setLight(tuneable, { brightness: 35 });
+  await api().setLight(tuneable, { colourTemperature: 4000 });
+  await api().setLight(colour, { colourTemperature: 4000 });
+  await api().setLight(colour, { hue: 180.4, saturation: 99.6 });
+
+  assert.deepEqual(requests.map((r) => [new URL(r.url).pathname, JSON.parse(r.body)]), [
+    ['/1.0/nodes/activeplug/p1', { status: 'ON' }],
+    ['/1.0/nodes/tuneablelight/l2', { status: 'OFF' }],
+    ['/1.0/nodes/tuneablelight/l2', { status: 'ON', brightness: 35 }],
+    ['/1.0/nodes/tuneablelight/l2', { colourTemperature: 4000 }],
+    ['/1.0/nodes/colourtuneablelight/l3', { colourMode: 'WHITE', colourTemperature: 4000 }],
+    ['/1.0/nodes/colourtuneablelight/l3', { colourMode: 'COLOUR', hue: '180', saturation: '100', value: '100' }],
+  ]);
+});

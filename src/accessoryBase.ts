@@ -3,13 +3,16 @@
  * rules for when it is reported as No Response instead of served as live.
  */
 
-import { Characteristic, Service, WithUUID } from 'homebridge';
+import { Characteristic, PlatformAccessory, Service, WithUUID } from 'homebridge';
 import type { HiveThermostatPlatform } from './platform';
+import { LOW_BATTERY_PERCENT } from './settings';
 
-export abstract class HiveAccessoryBase<State extends { online: boolean }> {
+export abstract class HiveAccessoryBase<State extends { online: boolean; battery?: number }> {
   protected latest?: State;
   /** Set while Hive is not answering; cleared by the next update(). */
   private unreachable = false;
+  /** Present once Hive has reported a battery level; see trackBattery(). */
+  private batteryService?: Service;
 
   protected constructor(
     protected readonly platform: HiveThermostatPlatform,
@@ -60,6 +63,64 @@ export abstract class HiveAccessoryBase<State extends { online: boolean }> {
       throw this.communicationFailure();
     }
     return this.latest;
+  }
+
+  // ---- Battery ---------------------------------------------------------------
+  //
+  // A Battery service is added with the first battery level Hive reports, so
+  // the level it shows is always a real one: HomeKit's default of 0% would
+  // raise a low-battery alert for a device that is fine. A poll that carries
+  // no reading keeps the last real one, which the characteristic holds.
+
+  /** Wire up a Battery service restored from the cache. Call from the constructor. */
+  protected restoreBattery(accessory: PlatformAccessory): void {
+    const cached = accessory.getService(this.platform.Service.Battery);
+    if (cached) {
+      this.attachBattery(cached);
+    }
+  }
+
+  /** Push the latest battery level, adding the service on the first one. */
+  protected trackBattery(accessory: PlatformAccessory, level: number | undefined): void {
+    if (level === undefined) {
+      return;
+    }
+    const { Service, Characteristic } = this.platform;
+    if (!this.batteryService) {
+      this.attachBattery(accessory.addService(Service.Battery));
+    }
+    this.batteryService!.updateCharacteristic(Characteristic.BatteryLevel, level);
+    this.batteryService!.updateCharacteristic(Characteristic.StatusLowBattery, this.lowBattery());
+  }
+
+  /** StatusLowBattery for the latest level, for services that carry it too. */
+  protected lowBattery(): number {
+    const { Characteristic } = this.platform;
+    return this.batteryLevel() <= LOW_BATTERY_PERCENT
+      ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+      : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
+  }
+
+  private attachBattery(service: Service): void {
+    const { Characteristic } = this.platform;
+    this.batteryService = service;
+    service
+      .getCharacteristic(Characteristic.BatteryLevel)
+      .onGet(() => this.guard(() => this.batteryLevel()));
+    service
+      .getCharacteristic(Characteristic.StatusLowBattery)
+      .onGet(() => this.guard(() => this.lowBattery()));
+    service
+      .getCharacteristic(Characteristic.ChargingState)
+      .onGet(() => Characteristic.ChargingState.NOT_CHARGEABLE);
+  }
+
+  private batteryLevel(): number {
+    const { Characteristic } = this.platform;
+    return (
+      this.latest?.battery ??
+      ((this.batteryService?.getCharacteristic(Characteristic.BatteryLevel).value as number) ?? 100)
+    );
   }
 
   private reportUnreachable(): void {

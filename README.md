@@ -6,7 +6,7 @@
 
 [![verified-by-homebridge](https://img.shields.io/badge/_-verified-blueviolet?color=%23491F59&style=flat&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
 
-A Homebridge plugin that exposes **Hive heating zones, radiator valves and hot water** to Apple HomeKit, talking directly to the Hive cloud API.
+A Homebridge plugin that exposes **Hive heating zones, radiator valves and hot water** — and Hive plugs, lights and sensors — to Apple HomeKit, talking directly to the Hive cloud API.
 
 It was written as a modern replacement for older Hive plugins that broke when Hive moved to AWS Cognito authentication with mandatory SMS two-factor auth. Authentication, token refresh, and the 2FA handshake are all handled here.
 
@@ -38,6 +38,7 @@ setup prefers.
 - Each heating zone exposed as a HomeKit **Thermostat** (current temp, target temp, off / heat / schedule)
 - Each room of Hive **radiator valves** (TRVs) exposed as its own **Thermostat**, with the same controls plus a **battery level** and low-battery warning
 - Hot water exposed as a **Switch** with a timed boost (like homebridge-nest): flip it on to run hot water for a configurable number of minutes, flip it off to cancel
+- Hive **plugs, lights and sensors** too (see [Other Hive devices](#other-hive-devices)) — on automatically, and each kind can be turned off
 - Optional Homebridge v2 **Matter** support: heating zones and radiator valves are also exposed as Matter Thermostats and hot water boosts as Matter On/Off Outlets
 - Reports **No Response** in the Home app when Hive marks a device offline, or when Hive itself stops answering, rather than showing stale data (Matter controllers see the device as unreachable)
 - One-time SMS 2FA during setup, then silent token refresh — no repeated SMS prompts
@@ -84,6 +85,31 @@ temperature change in Auto is a temporary override.
 Matter thermostat temperatures are exposed in Celsius. Hot water is exposed as
 an On/Off Outlet whose on state represents a manual boost, matching the HomeKit
 switch behavior.
+
+## Other Hive devices
+
+Hive's other devices are supported from the shapes Hive's API uses for them,
+but **have not been tested on real hardware yet**. If you have one, please
+report how it behaves in a GitHub issue — a debug log (Homebridge debug mode)
+helps most.
+
+| Hive device | HomeKit | Matter |
+|-------------|---------|--------|
+| Active Plug | Outlet (on/off, in use) | On/Off Outlet |
+| Warm white (dimmable) bulb | Lightbulb (on/off, brightness) | Dimmable Light |
+| Cool to warm white (tuneable) bulb | Lightbulb with colour temperature | Color Temperature Light |
+| Colour bulb | Lightbulb with colour temperature and colour | Extended Color Light |
+| Motion sensor | Motion Sensor, with battery | Occupancy Sensor |
+| Door/window sensor | Contact Sensor, with battery | Contact Sensor |
+
+- They appear automatically. To hide a kind, turn off **Show Hive Plugs**,
+  **Show Hive Lights** or **Show Hive Sensors** (`enablePlugs`,
+  `enableLights`, `enableSensors`); its accessories are then removed.
+- Hive bulbs dim in 5% steps, so a brightness is rounded to the nearest 5%.
+- Sensors are read from the Hive cloud at the poll interval, so motion and
+  door changes can take that long to show. They are not suited to fast
+  automations such as lights on at motion.
+- Battery level is shown over HomeKit only.
 
 ## Installation
 
@@ -149,6 +175,8 @@ Hive:
 - Heating zones and radiator valve rooms become Matter Thermostats. Battery
   level is shown over HomeKit only.
 - Hot water becomes a Matter On/Off Outlet for manual boost control.
+- Plugs, lights and sensors become the Matter devices listed under
+  [Other Hive devices](#other-hive-devices).
 - Hive schedules are not edited through Matter; Schedule maps to Matter Auto.
 
 ## Credits

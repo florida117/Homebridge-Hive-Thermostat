@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] - 2026-11-12
+
+### Added
+- **Hive plugs, lights and sensors**, over HomeKit and Matter. Active Plugs
+  appear as outlets; warm white, tuneable and colour bulbs as lights with
+  brightness, colour temperature and colour as the bulb supports; motion and
+  door/window sensors as sensors, with battery level over HomeKit. They are
+  on automatically, and new settings (`enablePlugs`, `enableLights`,
+  `enableSensors`) hide a kind. These follow the shapes Hive's API uses for
+  the devices but have not been tested on real hardware yet — reports welcome.
+
+### Fixed
+- **Toggling hot water from a Matter controller sent the command twice.**
+  It now reaches Hive once.
+
 ## [1.2.1] - 2026-11-12
 
 ### Fixed

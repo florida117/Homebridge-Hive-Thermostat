@@ -1,6 +1,15 @@
 import type { Logger, MatterAccessory, MatterAPI } from 'homebridge';
 import { HIVE_MAX_TEMP, HIVE_MIN_TEMP, PLATFORM_NAME, PLUGIN_NAME } from './settings';
-import { HiveHeatingZone, HiveHotWater, HiveMode } from './hiveApi';
+import {
+  HiveHeatingZone,
+  HiveHotWater,
+  HiveLight,
+  HiveLightChange,
+  HiveMode,
+  HivePlug,
+  HiveSensor,
+} from './hiveApi';
+import { hiveBrightness, kelvinToMireds } from './lightUnits';
 
 type MatterApiHost = {
   isMatterEnabled?: () => boolean;
@@ -12,13 +21,33 @@ type HiveMatterCommands = {
   setHeatingTarget(zone: HiveHeatingZone, temp: number): Promise<void>;
   setHotWaterBoost(id: string, minutes: number): Promise<void>;
   cancelHotWaterBoost(id: string, returnTo?: HiveMode): Promise<void>;
+  setPlug(id: string, on: boolean): Promise<void>;
+  setLight(light: Pick<HiveLight, 'id' | 'type'>, change: HiveLightChange): Promise<void>;
   pollSoon(delayMs?: number): void;
 };
 
 type HiveMatterContext = {
   hiveId: string;
-  kind: 'heating' | 'hotwater';
+  kind: 'heating' | 'hotwater' | 'plug' | 'light' | 'motionsensor' | 'contactsensor';
 };
+
+/** Everything register() is handed; the newer device lists may be omitted. */
+type MatterState = {
+  zones: HiveHeatingZone[];
+  hotWater: HiveHotWater[];
+  plugs?: HivePlug[];
+  lights?: HiveLight[];
+  sensors?: HiveSensor[];
+};
+
+/** Matter's level, hue and saturation all run 0–254. */
+const MATTER_MAX = 254;
+
+/** How long to wait for the other half of a hue/saturation pair. */
+const COLOUR_GATHER_MS = 100;
+
+/** Matter ColorControl colorMode values. */
+const COLOR_MODE = { HueSaturation: 0, Xy: 1, ColorTemperature: 2 } as const;
 
 const CELSIUS_TO_MATTER = 100;
 
@@ -98,6 +127,24 @@ export class HiveMatterPlatform {
   /** Latest heating zone state per Hive product id, for the same reason. */
   private readonly latestHeating = new Map<string, HiveHeatingZone>();
 
+  /** Latest plug, light and sensor state per Hive product id, likewise. */
+  private readonly latestPlugs = new Map<string, HivePlug>();
+  private readonly latestLights = new Map<string, HiveLight>();
+  private readonly latestSensors = new Map<string, HiveSensor>();
+
+  /**
+   * The halves of a combined hue/saturation command that matter.js is about to
+   * replay through the separate hue and saturation handlers, in Matter units.
+   * See lightAccessory().
+   */
+  private readonly replayedColour = new Map<string, { hue?: number; saturation?: number }>();
+
+  /** A light's hue/saturation being gathered into one write; see gatherColour(). */
+  private readonly pendingColour = new Map<
+    string,
+    { hue?: number; saturation?: number; write: Promise<void> }
+  >();
+
   /**
    * Attribute values this plugin has written and expects to see handed back to
    * itself, oldest first, keyed `<uuid>#<attribute>`.
@@ -155,10 +202,7 @@ export class HiveMatterPlatform {
     this.cached.set(accessory.UUID, accessory);
   }
 
-  async register(state: {
-    zones: HiveHeatingZone[];
-    hotWater: HiveHotWater[];
-  }): Promise<void> {
+  async register(state: MatterState): Promise<void> {
     if (!this.enabled || this.registered) {
       return;
     }
@@ -180,6 +224,9 @@ export class HiveMatterPlatform {
     const live = new Set([
       ...state.zones.map((zone) => this.heatingUuid(zone.id)),
       ...state.hotWater.map((hw) => this.hotWaterUuid(hw.id)),
+      ...(state.plugs ?? []).map((plug) => this.plugUuid(plug.id)),
+      ...(state.lights ?? []).map((light) => this.lightUuid(light.id)),
+      ...(state.sensors ?? []).map((sensor) => this.sensorUuid(sensor.id)),
     ]);
     const restored = await this.restoredUuids(matter);
     // The one exception is a composed thermostat. Homebridge cannot adopt it —
@@ -254,6 +301,15 @@ export class HiveMatterPlatform {
     for (const hw of state.hotWater) {
       await this.updateHotWater(this.latestHotWater.get(hw.id) ?? hw);
     }
+    for (const plug of state.plugs ?? []) {
+      await this.updatePlug(this.latestPlugs.get(plug.id) ?? plug);
+    }
+    for (const light of state.lights ?? []) {
+      await this.updateLight(this.latestLights.get(light.id) ?? light);
+    }
+    for (const sensor of state.sensors ?? []) {
+      await this.updateSensor(this.latestSensors.get(sensor.id) ?? sensor);
+    }
   }
 
   /**
@@ -317,19 +373,22 @@ export class HiveMatterPlatform {
   }
 
   /** Build and register all accessories using the resolved composition. */
-  private async registerWith(
-    matter: MatterAPI,
-    state: { zones: HiveHeatingZone[]; hotWater: HiveHotWater[] },
-  ): Promise<void> {
+  private async registerWith(matter: MatterAPI, state: MatterState): Promise<void> {
     const accessories = [
       ...state.zones.map((zone) => this.heatingAccessory(zone)),
       ...state.hotWater.map((hw) => this.hotWaterAccessory(matter, hw)),
+      ...(state.plugs ?? []).map((plug) => this.plugAccessory(matter, plug)),
+      ...(state.lights ?? []).map((light) => this.lightAccessory(matter, light)),
+      ...(state.sensors ?? []).map((sensor) => this.sensorAccessory(matter, sensor)),
     ];
     if (!accessories.length) {
       return;
     }
-    await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessories);
+    // One at a time: Homebridge registers a batch in order and gives up at the
+    // first accessory matter.js rejects, so one bad endpoint would take every
+    // accessory after it down too.
     for (const accessory of accessories) {
+      await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.cached.set(accessory.UUID, accessory);
     }
     this.log.info(`Hive: registered ${accessories.length} Matter accessories.`);
@@ -418,9 +477,18 @@ export class HiveMatterPlatform {
 
   /** The cluster whose state shows whether `accessory` has a live endpoint. */
   private stateCluster(matter: MatterAPI, accessory: MatterAccessory<HiveMatterContext>): string {
-    return accessory.context?.kind === 'hotwater'
-      ? matter.clusterNames.OnOff
-      : matter.clusterNames.Thermostat;
+    switch (accessory.context?.kind) {
+      case 'hotwater':
+      case 'plug':
+      case 'light':
+        return matter.clusterNames.OnOff;
+      case 'motionsensor':
+        return matter.clusterNames.OccupancySensing;
+      case 'contactsensor':
+        return matter.clusterNames.BooleanState;
+      default:
+        return matter.clusterNames.Thermostat;
+    }
   }
 
   /**
@@ -565,7 +633,71 @@ export class HiveMatterPlatform {
     await Promise.all([
       ...[...this.latestHeating.keys()].map((id) => this.writeReachable(this.heatingUuid(id), false)),
       ...[...this.latestHotWater.keys()].map((id) => this.writeReachable(this.hotWaterUuid(id), false)),
+      ...[...this.latestPlugs.keys()].map((id) => this.writeReachable(this.plugUuid(id), false)),
+      ...[...this.latestLights.keys()].map((id) => this.writeReachable(this.lightUuid(id), false)),
+      ...[...this.latestSensors.keys()].map((id) => this.writeReachable(this.sensorUuid(id), false)),
     ]);
+  }
+
+  async updatePlug(plug: HivePlug): Promise<void> {
+    this.latestPlugs.set(plug.id, plug);
+    if (!this.enabled || !this.registered) {
+      return;
+    }
+    const matter = this.api.matter!;
+    const uuid = this.plugUuid(plug.id);
+    await this.writeReachable(uuid, plug.online);
+    await this.writeIfChanged(uuid, matter.clusterNames.OnOff, { onOff: plug.on }, 'onOff');
+  }
+
+  /**
+   * Push a light's state. On/off, level and colour are separate writes with
+   * their own change detection, so a dimmer move does not resend the colour.
+   */
+  async updateLight(light: HiveLight): Promise<void> {
+    this.latestLights.set(light.id, light);
+    if (!this.enabled || !this.registered) {
+      return;
+    }
+    const matter = this.api.matter!;
+    const uuid = this.lightUuid(light.id);
+    await this.writeReachable(uuid, light.online);
+    await this.writeIfChanged(uuid, matter.clusterNames.OnOff, { onOff: light.on }, 'onOff');
+    await this.writeIfChanged(
+      uuid,
+      matter.clusterNames.LevelControl,
+      { currentLevel: toMatterLevel(light.brightness) },
+      'level',
+    );
+    const colour = this.colourState(light);
+    if (colour) {
+      await this.writeIfChanged(uuid, matter.clusterNames.ColorControl, colour, 'colour');
+    }
+  }
+
+  async updateSensor(sensor: HiveSensor): Promise<void> {
+    this.latestSensors.set(sensor.id, sensor);
+    if (!this.enabled || !this.registered) {
+      return;
+    }
+    const matter = this.api.matter!;
+    const uuid = this.sensorUuid(sensor.id);
+    await this.writeReachable(uuid, sensor.online);
+    if (sensor.type === 'motionsensor') {
+      await this.writeIfChanged(
+        uuid,
+        matter.clusterNames.OccupancySensing,
+        { occupancy: { occupied: sensor.triggered } },
+        'state',
+      );
+    } else {
+      await this.writeIfChanged(
+        uuid,
+        matter.clusterNames.BooleanState,
+        { stateValue: !sensor.triggered },
+        'state',
+      );
+    }
   }
 
   /**
@@ -800,17 +932,275 @@ export class HiveMatterPlatform {
             await this.commands.cancelHotWaterBoost(hw.id, this.current(hw).mode);
             this.commands.pollSoon();
           },
-          toggle: async () => {
-            const current = this.current(hw);
-            if (current.boosting) {
-              await this.commands.cancelHotWaterBoost(hw.id, current.mode);
-            } else {
-              await this.commands.setHotWaterBoost(hw.id, this.hotWaterBoostMinutes);
-            }
-            this.commands.pollSoon();
-          },
+          // ⚠️ Deliberately empty. matter.js carries out a toggle by calling
+          // on() or off(), which Homebridge routes to the handlers above — so
+          // acting here as well sent Hive every toggle twice.
+          toggle: () => undefined,
         },
       },
+    };
+  }
+
+  private plugAccessory(matter: MatterAPI, plug: HivePlug): MatterAccessory<HiveMatterContext> {
+    const uuid = this.plugUuid(plug.id);
+    const set = async (on: boolean) => {
+      await this.commands.setPlug(plug.id, on);
+      // The endpoint has moved to the commanded state; let the next poll
+      // confirm or correct it rather than skip it as unchanged.
+      this.forgetWritten(uuid, 'onOff');
+      this.commands.pollSoon();
+    };
+    return {
+      UUID: uuid,
+      displayName: plug.name,
+      deviceType: matter.deviceTypes.OnOffOutlet,
+      manufacturer: 'Hive',
+      model: 'Active Plug',
+      serialNumber: this.serialNumber(plug.id),
+      context: { hiveId: plug.id, kind: 'plug' },
+      clusters: { onOff: { onOff: plug.on } },
+      handlers: {
+        onOff: {
+          on: () => set(true),
+          off: () => set(false),
+          // matter.js turns a toggle into on() or off(); see hotWaterAccessory().
+          toggle: () => undefined,
+        },
+      },
+    };
+  }
+
+  /**
+   * A light: dimmable, colour temperature or extended colour, matching what
+   * the bulb does.
+   *
+   * ⚠️ Homebridge picks the ColorControl features from which handlers are
+   * registered (moveToHueAndSaturationLogic → HueSaturation, moveToColorLogic →
+   * Xy, moveToColorTemperatureLogic → ColorTemperature), and on 2.4 and earlier
+   * it rejects any command it routes to a handler that is missing. So every
+   * command a light can receive gets a handler, even where it does nothing.
+   */
+  private lightAccessory(matter: MatterAPI, light: HiveLight): MatterAccessory<HiveMatterContext> {
+    const uuid = this.lightUuid(light.id);
+    const current = () => this.latestLights.get(light.id) ?? light;
+    const send = async (change: HiveLightChange, part: string) => {
+      await this.commands.setLight(current(), change);
+      this.forgetWritten(uuid, part);
+      this.commands.pollSoon();
+    };
+    const setOn = (on: boolean) => send({ on }, 'onOff');
+    const setLevel = async (level: number, withOnOff: boolean) => {
+      if (level <= 0) {
+        // MoveToLevelWithOnOff to zero turns the light off.
+        await send({ on: false }, 'onOff');
+        return;
+      }
+      if (!withOnOff && !current().on) {
+        // Plain MoveToLevel leaves an off light off, but any Hive brightness
+        // write turns the light on — so there is nothing to send until it is.
+        this.forgetWritten(uuid, 'level');
+        return;
+      }
+      await send({ brightness: hiveBrightness(fromMatterLevel(level)) }, 'level');
+      this.forgetWritten(uuid, 'onOff');
+    };
+    // Continuous moves end wherever the controller stops them, which Hive has
+    // no command for; the next poll puts the level back to what Hive has.
+    const abandonLevel = () => this.forgetWritten(uuid, 'level');
+
+    const tuneable = light.type !== 'warmwhitelight';
+    const colour = light.type === 'colourtuneablelight';
+    const deviceType = colour
+      ? matter.deviceTypes.ExtendedColorLight
+      : tuneable
+        ? matter.deviceTypes.ColorTemperatureLight
+        : matter.deviceTypes.DimmableLight;
+
+    const colourHandlers = {
+      moveToColorTemperatureLogic: async ({ colorTemperatureMireds }: { colorTemperatureMireds: number }) => {
+        const range = current().colourTemperatureRange;
+        let kelvin = kelvinToMireds(colorTemperatureMireds);
+        if (range) {
+          kelvin = Math.min(range.max, Math.max(range.min, kelvin));
+        }
+        await send({ colourTemperature: kelvin }, 'colour');
+      },
+      // Called by matter.js itself on every colour mode switch: nothing to send.
+      stopAllColorMovement: () => undefined,
+      ...(colour
+        ? {
+          // ⚠️ After this handler returns, matter.js carries the command out by
+          // calling the hue and saturation handlers below with the same values.
+          // Those replays are expected here and skipped there, or every colour
+          // would reach Hive three times.
+          moveToHueAndSaturationLogic: async ({ hue, saturation }: { hue: number; saturation: number }) => {
+            this.expectReplay(light.id, { hue, saturation });
+            await this.gatherColour(light.id, {
+              hue: fromMatterHue(hue),
+              saturation: fromMatterPercent(saturation),
+            });
+          },
+          moveToHueLogic: async ({ targetHue }: { targetHue: number }) => {
+            if (!this.isReplay(light.id, 'hue', targetHue)) {
+              await this.gatherColour(light.id, { hue: fromMatterHue(targetHue) });
+            }
+          },
+          moveToSaturationLogic: async ({ targetSaturation }: { targetSaturation: number }) => {
+            if (!this.isReplay(light.id, 'saturation', targetSaturation)) {
+              await this.gatherColour(light.id, { saturation: fromMatterPercent(targetSaturation) });
+            }
+          },
+          moveToColorLogic: ({ targetX, targetY }: { targetX: number; targetY: number }) =>
+            this.gatherColour(light.id, hueSaturationFromXy(targetX / 65536, targetY / 65536)),
+        }
+        : {}),
+    };
+
+    return {
+      UUID: uuid,
+      displayName: light.name,
+      deviceType,
+      manufacturer: 'Hive',
+      model: 'Active Light',
+      serialNumber: this.serialNumber(light.id),
+      context: { hiveId: light.id, kind: 'light' },
+      clusters: {
+        onOff: { onOff: light.on },
+        levelControl: { currentLevel: toMatterLevel(light.brightness), minLevel: 1, maxLevel: MATTER_MAX },
+        ...(tuneable ? { colorControl: this.colourState(light, true) } : {}),
+      },
+      handlers: {
+        onOff: {
+          on: () => setOn(true),
+          off: () => setOn(false),
+          // matter.js turns a toggle into on() or off(); see hotWaterAccessory().
+          toggle: () => undefined,
+        },
+        levelControl: {
+          moveToLevel: ({ level }: { level: number }) => setLevel(level, false),
+          moveToLevelWithOnOff: ({ level }: { level: number }) => setLevel(level, true),
+          step: async ({ stepMode, stepSize }: { stepMode: number; stepSize: number }) => {
+            // stepMode 0 is up, 1 is down; Hive takes only absolute levels.
+            const now = toMatterLevel(current().brightness);
+            const level = Math.min(MATTER_MAX, Math.max(1, now + (stepMode === 1 ? -stepSize : stepSize)));
+            await setLevel(level, false);
+          },
+          move: abandonLevel,
+          stop: abandonLevel,
+        },
+        ...(tuneable ? { colorControl: colourHandlers } : {}),
+      },
+    };
+  }
+
+  /**
+   * Expect matter.js to replay a combined colour command's halves. Bounded in
+   * time, so a Homebridge that does not replay leaves nothing to swallow a
+   * later command with.
+   */
+  private expectReplay(id: string, colour: { hue: number; saturation: number }): void {
+    const expected = { ...colour };
+    this.replayedColour.set(id, expected);
+    setTimeout(() => {
+      if (this.replayedColour.get(id) === expected) {
+        this.replayedColour.delete(id);
+      }
+    }, 2000);
+  }
+
+  /** True, consuming the expectation, when a hue or saturation is a replay. */
+  private isReplay(id: string, half: 'hue' | 'saturation', value: number): boolean {
+    const expected = this.replayedColour.get(id);
+    if (expected?.[half] !== value) {
+      return false;
+    }
+    delete expected[half];
+    if (expected.hue === undefined && expected.saturation === undefined) {
+      this.replayedColour.delete(id);
+    }
+    return true;
+  }
+
+  /**
+   * Collect a hue and/or saturation for a light and send them to Hive as one
+   * write, so a controller that sets hue and saturation as two commands does
+   * not flash through a colour made of the new hue and the old saturation.
+   * Every caller settles with that one write.
+   */
+  private gatherColour(id: string, part: { hue?: number; saturation?: number }): Promise<void> {
+    let pending = this.pendingColour.get(id);
+    if (!pending) {
+      const entry = {} as { hue?: number; saturation?: number; write: Promise<void> };
+      entry.write = new Promise((resolve) => setTimeout(resolve, COLOUR_GATHER_MS)).then(async () => {
+        this.pendingColour.delete(id);
+        const light = this.latestLights.get(id);
+        if (!light) {
+          return;
+        }
+        await this.commands.setLight(light, {
+          hue: entry.hue ?? light.hue ?? 0,
+          saturation: entry.saturation ?? light.saturation ?? 100,
+        });
+        this.forgetWritten(this.lightUuid(id), 'colour');
+        this.commands.pollSoon();
+      });
+      this.pendingColour.set(id, entry);
+      pending = entry;
+    }
+    Object.assign(pending, part);
+    return pending.write;
+  }
+
+  /**
+   * A light's ColorControl attributes, or undefined for a light without one.
+   * `initial` adds the fixed physical range, which is only set at registration.
+   */
+  private colourState(light: HiveLight, initial = false): Record<string, number> | undefined {
+    if (light.type === 'warmwhitelight') {
+      return undefined;
+    }
+    const range = light.colourTemperatureRange ?? { min: 2700, max: 6535 };
+    const coolest = kelvinToMireds(range.max);
+    const warmest = kelvinToMireds(range.min);
+    const mireds = Math.min(
+      warmest,
+      Math.max(coolest, kelvinToMireds(light.colourTemperature ?? range.min)),
+    );
+    const state: Record<string, number> = {
+      colorTemperatureMireds: mireds,
+      colorMode: light.colourMode === 'COLOUR' ? COLOR_MODE.HueSaturation : COLOR_MODE.ColorTemperature,
+      ...(initial
+        ? {
+          colorTempPhysicalMinMireds: coolest,
+          colorTempPhysicalMaxMireds: warmest,
+          // Mandatory with the ColorTemperature feature. Hive does not couple
+          // colour temperature to level, so this only has to be legal.
+          coupleColorTempToLevelMinMireds: coolest,
+        }
+        : {}),
+    };
+    if (light.type === 'colourtuneablelight') {
+      state.currentHue = toMatterHue(light.hue ?? 0);
+      state.currentSaturation = toMatterPercent(light.saturation ?? 0);
+    }
+    return state;
+  }
+
+  /** Motion as an occupancy sensor, a window/door sensor as a contact sensor. */
+  private sensorAccessory(matter: MatterAPI, sensor: HiveSensor): MatterAccessory<HiveMatterContext> {
+    const motion = sensor.type === 'motionsensor';
+    return {
+      UUID: this.sensorUuid(sensor.id),
+      displayName: sensor.name,
+      deviceType: motion ? matter.deviceTypes.MotionSensor : matter.deviceTypes.ContactSensor,
+      manufacturer: 'Hive',
+      model: motion ? 'Motion Sensor' : 'Window/Door Sensor',
+      serialNumber: this.serialNumber(sensor.id),
+      context: { hiveId: sensor.id, kind: sensor.type },
+      clusters: motion
+        ? { occupancySensing: { occupancy: { occupied: sensor.triggered } } }
+        // Matter's contact sensor reports true while the contact is closed.
+        : { booleanState: { stateValue: !sensor.triggered } },
     };
   }
 
@@ -949,4 +1339,80 @@ export class HiveMatterPlatform {
   private hotWaterUuid(id: string): string {
     return this.api.matter!.uuid.generate(`hive-matter-hotwater-${id}`);
   }
+
+  private plugUuid(id: string): string {
+    return this.api.matter!.uuid.generate(`hive-matter-plug-${id}`);
+  }
+
+  private lightUuid(id: string): string {
+    return this.api.matter!.uuid.generate(`hive-matter-light-${id}`);
+  }
+
+  private sensorUuid(id: string): string {
+    return this.api.matter!.uuid.generate(`hive-matter-sensor-${id}`);
+  }
+}
+
+// ---- Matter unit conversions ------------------------------------------------
+
+/** A Hive brightness (0–100) as a Matter level (1–254). */
+function toMatterLevel(percent: number): number {
+  return Math.max(1, Math.min(MATTER_MAX, Math.round((percent * MATTER_MAX) / 100)));
+}
+
+/** A Matter level (0–254) as a percentage. */
+function fromMatterLevel(level: number): number {
+  return (level * 100) / MATTER_MAX;
+}
+
+function toMatterHue(degrees: number): number {
+  return Math.round((degrees * MATTER_MAX) / 360) % (MATTER_MAX + 1);
+}
+
+function fromMatterHue(hue: number): number {
+  return Math.round((hue * 360) / MATTER_MAX) % 360;
+}
+
+function toMatterPercent(percent: number): number {
+  return Math.round((percent * MATTER_MAX) / 100);
+}
+
+function fromMatterPercent(value: number): number {
+  return Math.min(100, Math.round((value * 100) / MATTER_MAX));
+}
+
+/**
+ * A CIE 1931 xy colour as hue (0–360) and saturation (0–100), through linear
+ * sRGB. Brightness is not part of an xy colour, so the light's level carries
+ * it, as Hive's own colour writes do.
+ */
+export function hueSaturationFromXy(x: number, y: number): { hue: number; saturation: number } {
+  if (y <= 0) {
+    return { hue: 0, saturation: 0 };
+  }
+  const X = x / y;
+  const Z = (1 - x - y) / y;
+  const linear = [
+    3.2406 * X - 1.5372 - 0.4986 * Z,
+    -0.9689 * X + 1.8758 + 0.0415 * Z,
+    0.0557 * X - 0.204 + 1.057 * Z,
+  ].map((c) => Math.max(0, c));
+  const peak = Math.max(...linear);
+  if (peak === 0) {
+    return { hue: 0, saturation: 0 };
+  }
+  const [r, g, b] = linear.map((c) => c / peak);
+  const min = Math.min(r, g, b);
+  const delta = 1 - min;
+  let hue = 0;
+  if (delta > 0) {
+    if (r === 1) {
+      hue = 60 * (((g - b) / delta) % 6);
+    } else if (g === 1) {
+      hue = 60 * ((b - r) / delta + 2);
+    } else {
+      hue = 60 * ((r - g) / delta + 4);
+    }
+  }
+  return { hue: Math.round((hue + 360) % 360), saturation: Math.round(delta * 100) };
 }

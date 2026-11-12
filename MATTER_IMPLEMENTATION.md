@@ -21,6 +21,7 @@ both HomeKit (HAP) and — when the bridge has Matter enabled — Matter.
 | `src/hiveApi.ts` | Thin client over Hive's beekeeper API: `GET /nodes/all` to read state, `POST /nodes/{type}/{id}` to write mode / target / boost. |
 | `src/heatingAccessory.ts` | HAP Thermostat service for a heating zone. |
 | `src/hotWaterAccessory.ts` | HAP service for hot water boost. |
+| `src/plugAccessory.ts`, `src/lightAccessory.ts`, `src/sensorAccessory.ts` | HAP services for plugs, lights and sensors. |
 | `src/matterPlatform.ts` | **`HiveMatterPlatform`** — all Matter registration and state sync. |
 | `src/timeout.ts` | Deadlines for network calls: `fetchWithTimeout()` (built-in `fetch` with an abort signal) and `withTimeout()` for Cognito's calls. |
 
@@ -96,6 +97,36 @@ Matter instance. This was fixed earlier on the branch (commit `e2eca4b`).
 - Hot water → Matter **OnOffOutlet** used as a boost switch. On = start boost
   for the configured minutes; Off = return to the previous mode.
 - Temperatures are Celsius × 100 (Matter's centidegree unit).
+- Active Plug → **OnOffOutlet**.
+- Bulbs → **DimmableLight** (warm white), **ColorTemperatureLight** (tuneable)
+  or **ExtendedColorLight** (colour). Level 1–254 maps to Hive's 0–100%
+  brightness in 5% steps; a level of 0 with on/off turns the light off.
+  Homebridge picks ColorControl features from the handlers registered, so the
+  handlers decide HueSaturation / Xy / ColorTemperature. XY colours are
+  converted to hue/saturation through sRGB, since Hive takes only those. The
+  ColorTemperature feature requires `coupleColorTempToLevelMinMireds`, which is
+  set with the physical range from Hive's kelvin limits.
+- Motion sensor → **MotionSensor** (occupancy sensing); door/window sensor →
+  **ContactSensor** (BooleanState `stateValue` true when closed). Battery is
+  HomeKit only.
+
+#### matter.js behaviours the handlers allow for
+
+- **Toggle runs on/off.** matter.js carries out `toggle` by calling the
+  cluster's own `on()`/`off()`, which reach the plugin's handlers. A toggle
+  handler that also wrote to Hive sent every toggle twice, so toggle handlers
+  (plugs, lights, hot water) do nothing.
+- **Hue and saturation are replayed.** After a `moveToHueAndSaturation`
+  handler returns, matter.js replays it as `moveToHue` and
+  `moveToSaturation`. The combined handler marks the colour as expected, and
+  the single handlers skip a matching replay (expiring after 2s), so a colour
+  reaches Hive once.
+- **Every command needs a handler.** On Homebridge ≤ 2.4 a command with no
+  handler fails, so `stopAllColorMovement`, `move` and `stop` have no-op or
+  baseline-resetting handlers.
+- **Registration is one accessory per call.** Homebridge abandons a batch at
+  its first rejected accessory, so one bad light would leave every accessory
+  after it unregistered.
 
 ## 3. The bug that stopped Matter working
 
