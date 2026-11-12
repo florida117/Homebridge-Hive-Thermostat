@@ -24,7 +24,7 @@
 import { PlatformAccessory, Service, CharacteristicValue } from 'homebridge';
 import type { HiveThermostatPlatform } from './platform';
 import { HiveHeatingType, HiveHeatingZone, HiveMode } from './hiveApi';
-import { HIVE_MIN_TEMP, HIVE_MAX_TEMP, HIVE_TEMP_STEP } from './settings';
+import { HIVE_MIN_TEMP, HIVE_MAX_TEMP, HIVE_TEMP_STEP, clampTarget } from './settings';
 import { HiveAccessoryBase } from './accessoryBase';
 
 export class HiveHeatingAccessory extends HiveAccessoryBase<HiveHeatingZone> {
@@ -73,7 +73,7 @@ export class HiveHeatingAccessory extends HiveAccessoryBase<HiveHeatingZone> {
         maxValue: HIVE_MAX_TEMP,
         minStep: HIVE_TEMP_STEP,
       })
-      .onGet(() => this.guard(() => this.latest!.targetTemperature))
+      .onGet(() => this.guard(() => clampTarget(this.latest!.targetTemperature)))
       .onSet((v) => this.setTargetTemp(v));
 
     this.service
@@ -100,7 +100,7 @@ export class HiveHeatingAccessory extends HiveAccessoryBase<HiveHeatingZone> {
     );
     this.service.updateCharacteristic(
       Characteristic.TargetTemperature,
-      zone.targetTemperature,
+      clampTarget(zone.targetTemperature),
     );
     this.service.updateCharacteristic(
       Characteristic.CurrentHeatingCoolingState,

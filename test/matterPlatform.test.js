@@ -298,6 +298,50 @@ test('a thermostat that does not come online is retried with the other Presets c
   assert.ok(log.messages('info').some((m) => m.includes('online with Presets=true')));
 });
 
+test('a registration Homebridge refuses is retried, without holding up the rest', async () => {
+  let refusing = true;
+  const fake = h.createMatter({ throws: (accessory) => refusing && accessory.UUID === HEATING });
+  const log = h.createLog();
+  const platform = new HiveMatterPlatform(
+    { isMatterEnabled: () => true, matter: fake.matter },
+    log,
+    h.recordCommands().commands,
+    30,
+  );
+
+  await platform.register({ zones: [h.zone()], hotWater: [h.hotWater()] });
+  await h.settle();
+  assert.equal(fake.endpoints.has(HEATING), false);
+  assert.equal(platform.needsRegistration, true);
+  assert.ok(log.messages('warn').some((m) => m.includes('could not register Matter accessory "Downstairs"')));
+  assert.ok(
+    !log.messages('warn').some((m) => m.includes('Presets')),
+    'a refusal is not mistaken for a thermostat that failed conformance',
+  );
+
+  // Everything else registered and keeps updating meanwhile.
+  await platform.updateHotWater(h.hotWater({ boosting: true }));
+  await h.settle();
+  assert.equal(fake.state(HOT_WATER, 'onOff').onOff, true);
+
+  refusing = false;
+  const later = h.zone({ targetTemperature: 21 });
+  await platform.updateHeating(later);
+  await platform.register({ zones: [later], hotWater: [h.hotWater({ boosting: true })] });
+  await h.settle();
+
+  assert.equal(fake.state(HEATING).occupiedHeatingSetpoint, 2100);
+  assert.equal(platform.needsRegistration, false);
+  assert.deepEqual(fake.calls.conflicts, []);
+  assert.deepEqual(fake.calls.registered, [HOT_WATER, HEATING]);
+});
+
+test('a target outside the range Hive accepts becomes the nearest setpoint Matter allows', async () => {
+  const { fake } = await setup({ zones: [h.zone({ mode: 'OFF', targetTemperature: 1 })] });
+
+  assert.equal(fake.state(HEATING).occupiedHeatingSetpoint, 500);
+});
+
 // ---- Radiator valves --------------------------------------------------------
 
 test('a radiator valve room is a Matter thermostat whose commands carry its product type', async () => {

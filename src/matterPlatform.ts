@@ -1,5 +1,5 @@
 import type { Logger, MatterAccessory, MatterAPI } from 'homebridge';
-import { HIVE_MAX_TEMP, HIVE_MIN_TEMP, PLATFORM_NAME, PLUGIN_NAME } from './settings';
+import { HIVE_MAX_TEMP, HIVE_MIN_TEMP, PLATFORM_NAME, PLUGIN_NAME, clampTarget } from './settings';
 import {
   HiveHeatingZone,
   HiveHotWater,
@@ -113,6 +113,14 @@ type ThermostatComposition = {
 export class HiveMatterPlatform {
   private readonly cached = new Map<string, MatterAccessory<HiveMatterContext>>();
   private registered = false;
+
+  /**
+   * Accessories whose registration threw, by UUID, for register() to try again.
+   * Homebridge refuses registrations while its Matter server is still starting
+   * and says that this passes, so one refusal must not cost the accessory for
+   * the life of the process.
+   */
+  private readonly failedRegistrations = new Set<string>();
   /** Resolved once per registration by composeThermostat(). */
   private thermostat?: ThermostatComposition;
 
@@ -198,12 +206,25 @@ export class HiveMatterPlatform {
     return this.api.isMatterEnabled?.() === true && !!this.api.matter;
   }
 
+  /** Whether register() still has something to do: call it again until not. */
+  get needsRegistration(): boolean {
+    return this.enabled && (!this.registered || this.failedRegistrations.size > 0);
+  }
+
   configureAccessory(accessory: MatterAccessory<HiveMatterContext>): void {
     this.cached.set(accessory.UUID, accessory);
   }
 
+  /**
+   * Register the Matter accessories for `state`. Once that has been done, a
+   * later call only retries the accessories whose registration threw.
+   */
   async register(state: MatterState): Promise<void> {
-    if (!this.enabled || this.registered) {
+    if (!this.enabled) {
+      return;
+    }
+    if (this.registered) {
+      await this.retryFailedRegistrations(state);
       return;
     }
 
@@ -221,13 +242,7 @@ export class HiveMatterPlatform {
     // always was. Older Homebridge could not reuse a cached endpoint (it came
     // from another matter.js module instance, failing with "identify is not a
     // Behavior.Type").
-    const live = new Set([
-      ...state.zones.map((zone) => this.heatingUuid(zone.id)),
-      ...state.hotWater.map((hw) => this.hotWaterUuid(hw.id)),
-      ...(state.plugs ?? []).map((plug) => this.plugUuid(plug.id)),
-      ...(state.lights ?? []).map((light) => this.lightUuid(light.id)),
-      ...(state.sensors ?? []).map((sensor) => this.sensorUuid(sensor.id)),
-    ]);
+    const live = new Set(this.liveUuids(state));
     const restored = await this.restoredUuids(matter);
     // The one exception is a composed thermostat. Homebridge cannot adopt it —
     // the cache records a device type by name, not the features composed onto
@@ -247,7 +262,7 @@ export class HiveMatterPlatform {
     await this.waitUntilGone(matter, rebuild);
 
     if (live.size === 0) {
-      this.registered = true;
+      // Nothing to register yet; a later poll that finds devices does it.
       return;
     }
 
@@ -256,59 +271,122 @@ export class HiveMatterPlatform {
         `(Presets=${this.thermostat.presets}).`,
     );
 
-    await this.registerWith(matter, state);
+    await this.registerAndVerify(matter, state);
+    this.registered = true;
+    await this.pushLatest(state);
+  }
 
-    // The feature set is derived rather than guessed, so verification is
-    // normally just a health check. It is still wired to a retry, because the
-    // one thing composeThermostat() cannot derive is a Homebridge generation
-    // that does not exist yet: a future release that pre-composes the device
-    // type differently would land us on the wrong side of the Presets decision,
-    // matter.js would reject the endpoint for conformance, and a thermostat
-    // that fails validation never enters the live accessory map — its state
-    // stays unreadable for the life of the process. Flipping the one derived
-    // bit and re-registering costs a few seconds at startup and turns that
-    // dead accessory back into a working one.
-    if (state.zones.length > 0 && !(await this.verifyThermostats(matter, state))) {
-      this.log.warn(
-        `Hive: thermostat endpoint(s) did not come online with Presets=${this.thermostat.presets}. ` +
-          'Retrying once with the opposite setting.',
-      );
-      this.thermostat = { ...this.thermostat, presets: !this.thermostat.presets };
-      // Only the thermostats are rebuilt; the hot water endpoints are healthy.
-      const thermostats = new Set(state.zones.map((zone) => this.heatingUuid(zone.id)));
-      await this.unregisterCached(matter, (uuid) => thermostats.has(uuid));
-      await this.registerWith(matter, { zones: state.zones, hotWater: [] });
-      if (!(await this.verifyThermostats(matter, state))) {
-        this.log.error(
-          'Hive: thermostat endpoint(s) did not come online. Please open a GitHub ' +
-            'issue with the Homebridge log and your Homebridge version.',
-        );
-      } else {
-        this.log.info(
-          `Hive: thermostat endpoint(s) online with Presets=${this.thermostat.presets}.`,
-        );
+  /**
+   * Try again to register the accessories in `state` whose registration threw.
+   * A product that has left the account since is dropped instead.
+   */
+  private async retryFailedRegistrations(state: MatterState): Promise<void> {
+    if (this.failedRegistrations.size === 0) {
+      return;
+    }
+    const failed = (uuid: string) => this.failedRegistrations.has(uuid);
+    const retry: MatterState = {
+      zones: state.zones.filter((zone) => failed(this.heatingUuid(zone.id))),
+      hotWater: state.hotWater.filter((hw) => failed(this.hotWaterUuid(hw.id))),
+      plugs: (state.plugs ?? []).filter((plug) => failed(this.plugUuid(plug.id))),
+      lights: (state.lights ?? []).filter((light) => failed(this.lightUuid(light.id))),
+      sensors: (state.sensors ?? []).filter((sensor) => failed(this.sensorUuid(sensor.id))),
+    };
+    const retrying = new Set(this.liveUuids(retry));
+    for (const uuid of this.failedRegistrations) {
+      if (!retrying.has(uuid)) {
+        this.failedRegistrations.delete(uuid);
       }
     }
+    if (retrying.size === 0) {
+      return;
+    }
+    await this.registerAndVerify(this.api.matter!, retry);
+    await this.pushLatest(retry);
+  }
 
-    this.registered = true;
+  /** The UUID of every accessory `state` calls for. */
+  private liveUuids(state: MatterState): string[] {
+    return [
+      ...state.zones.map((zone) => this.heatingUuid(zone.id)),
+      ...state.hotWater.map((hw) => this.hotWaterUuid(hw.id)),
+      ...(state.plugs ?? []).map((plug) => this.plugUuid(plug.id)),
+      ...(state.lights ?? []).map((light) => this.lightUuid(light.id)),
+      ...(state.sensors ?? []).map((sensor) => this.sensorUuid(sensor.id)),
+    ];
+  }
 
-    // Push live state now. Updates that arrived before registration were only
-    // recorded, and an adopted endpoint still holds whatever was cached at the
-    // last shutdown, which would otherwise be on show until the next poll.
+  /**
+   * Register the accessories in `state`, then check that the thermostats came
+   * online.
+   *
+   * The feature set is derived rather than guessed, so verification is
+   * normally just a health check. It is still wired to a retry, because the
+   * one thing composeThermostat() cannot derive is a Homebridge generation
+   * that does not exist yet: a future release that pre-composes the device
+   * type differently would land us on the wrong side of the Presets decision,
+   * matter.js would reject the endpoint for conformance, and a thermostat
+   * that fails validation never enters the live accessory map — its state
+   * stays unreadable for the life of the process. Flipping the one derived
+   * bit and re-registering costs a few seconds at startup and turns that
+   * dead accessory back into a working one.
+   *
+   * A thermostat whose registration threw is left out of the check: it says
+   * nothing about Presets, and it is retried as it was on a later poll.
+   */
+  private async registerAndVerify(matter: MatterAPI, state: MatterState): Promise<void> {
+    const threw = await this.registerWith(matter, state);
+    const zones = state.zones.filter((zone) => !threw.has(this.heatingUuid(zone.id)));
+    if (zones.length === 0 || (await this.verifyThermostats(matter, { zones }))) {
+      return;
+    }
+    this.log.warn(
+      `Hive: thermostat endpoint(s) did not come online with Presets=${this.thermostat!.presets}. ` +
+        'Retrying once with the opposite setting.',
+    );
+    this.thermostat = { ...this.thermostat!, presets: !this.thermostat!.presets };
+    // Only the thermostats are rebuilt; the other endpoints are healthy.
+    const thermostats = new Set(zones.map((zone) => this.heatingUuid(zone.id)));
+    await this.unregisterCached(matter, (uuid) => thermostats.has(uuid));
+    await this.registerWith(matter, { zones, hotWater: [] });
+    if (!(await this.verifyThermostats(matter, { zones }))) {
+      this.log.error(
+        'Hive: thermostat endpoint(s) did not come online. Please open a GitHub ' +
+          'issue with the Homebridge log and your Homebridge version.',
+      );
+    } else {
+      this.log.info(
+        `Hive: thermostat endpoint(s) online with Presets=${this.thermostat.presets}.`,
+      );
+    }
+  }
+
+  /**
+   * Push live state for everything in `state`. Updates that arrived before
+   * registration were only recorded, and an adopted endpoint still holds
+   * whatever was cached at the last shutdown, which would otherwise be on show
+   * until the next poll. An accessory that failed to register cannot take
+   * one, which must not keep the rest from theirs.
+   */
+  private async pushLatest(state: MatterState): Promise<void> {
+    const push = (update: Promise<void>) =>
+      update.catch((err) =>
+        this.log.debug(`Hive: Matter state update failed: ${(err as Error).message}`),
+      );
     for (const zone of state.zones) {
-      await this.updateHeating(this.latestHeating.get(zone.id) ?? zone);
+      await push(this.updateHeating(this.latestHeating.get(zone.id) ?? zone));
     }
     for (const hw of state.hotWater) {
-      await this.updateHotWater(this.latestHotWater.get(hw.id) ?? hw);
+      await push(this.updateHotWater(this.latestHotWater.get(hw.id) ?? hw));
     }
     for (const plug of state.plugs ?? []) {
-      await this.updatePlug(this.latestPlugs.get(plug.id) ?? plug);
+      await push(this.updatePlug(this.latestPlugs.get(plug.id) ?? plug));
     }
     for (const light of state.lights ?? []) {
-      await this.updateLight(this.latestLights.get(light.id) ?? light);
+      await push(this.updateLight(this.latestLights.get(light.id) ?? light));
     }
     for (const sensor of state.sensors ?? []) {
-      await this.updateSensor(this.latestSensors.get(sensor.id) ?? sensor);
+      await push(this.updateSensor(this.latestSensors.get(sensor.id) ?? sensor));
     }
   }
 
@@ -372,8 +450,12 @@ export class HiveMatterPlatform {
     };
   }
 
-  /** Build and register all accessories using the resolved composition. */
-  private async registerWith(matter: MatterAPI, state: MatterState): Promise<void> {
+  /**
+   * Build and register the accessories in `state` using the resolved
+   * composition. Returns the UUIDs whose registration threw, which are also
+   * kept for register() to retry.
+   */
+  private async registerWith(matter: MatterAPI, state: MatterState): Promise<Set<string>> {
     const accessories = [
       ...state.zones.map((zone) => this.heatingAccessory(zone)),
       ...state.hotWater.map((hw) => this.hotWaterAccessory(matter, hw)),
@@ -381,17 +463,38 @@ export class HiveMatterPlatform {
       ...(state.lights ?? []).map((light) => this.lightAccessory(matter, light)),
       ...(state.sensors ?? []).map((sensor) => this.sensorAccessory(matter, sensor)),
     ];
-    if (!accessories.length) {
-      return;
-    }
+    const threw = new Set<string>();
     // One at a time: Homebridge registers a batch in order and gives up at the
     // first accessory matter.js rejects, so one bad endpoint would take every
-    // accessory after it down too.
+    // accessory after it down too. For the same reason a registration that
+    // throws is recorded and skipped, not allowed to end the loop.
     for (const accessory of accessories) {
-      await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      try {
+        await matter.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      } catch (err) {
+        const message =
+          `Hive: could not register Matter accessory "${accessory.displayName}" ` +
+          `(${(err as Error).message}). Retrying on the next poll.`;
+        if (this.failedRegistrations.has(accessory.UUID)) {
+          this.log.debug(message);
+        } else {
+          this.log.warn(message);
+        }
+        this.failedRegistrations.add(accessory.UUID);
+        threw.add(accessory.UUID);
+        continue;
+      }
+      this.failedRegistrations.delete(accessory.UUID);
       this.cached.set(accessory.UUID, accessory);
+      // A fresh endpoint starts from the cluster values passed here, so a
+      // baseline recorded while it was missing must not suppress the next push.
+      this.forgetWritten(accessory.UUID);
     }
-    this.log.info(`Hive: registered ${accessories.length} Matter accessories.`);
+    const registered = accessories.length - threw.size;
+    if (registered > 0) {
+      this.log.info(`Hive: registered ${registered} Matter accessories.`);
+    }
+    return threw;
   }
 
   /**
@@ -572,7 +675,7 @@ export class HiveMatterPlatform {
       this.forgetWritten(uuid, 'state');
     }
 
-    const heatingSetpoint = this.toMatterTemperature(zone.targetTemperature);
+    const heatingSetpoint = this.toMatterTemperature(clampTarget(zone.targetTemperature));
     const coolingSetpoint = this.toMatterTemperature(COOL_MAX_TEMP);
     this.expectEcho(uuid, 'occupiedHeatingSetpoint', heatingSetpoint);
     this.expectEcho(uuid, 'occupiedCoolingSetpoint', coolingSetpoint);
@@ -895,10 +998,7 @@ export class HiveMatterPlatform {
             // cooling write. Either way the heating change only reaches Hive
             // from here. `amount` is a delta in 0.1°C steps.
             const current = this.currentZone(zone);
-            const target = Math.min(
-              HIVE_MAX_TEMP,
-              Math.max(HIVE_MIN_TEMP, current.targetTemperature + amount / 10),
-            );
+            const target = clampTarget(clampTarget(current.targetTemperature) + amount / 10);
             await this.commands.setHeatingTarget(current, target);
             this.commands.pollSoon();
           },
@@ -1224,7 +1324,7 @@ export class HiveMatterPlatform {
 
     return {
       localTemperature: this.toMatterTemperature(zone.currentTemperature),
-      occupiedHeatingSetpoint: this.toMatterTemperature(zone.targetTemperature),
+      occupiedHeatingSetpoint: this.toMatterTemperature(clampTarget(zone.targetTemperature)),
       absMinHeatSetpointLimit: min,
       absMaxHeatSetpointLimit: max,
       minHeatSetpointLimit: min,

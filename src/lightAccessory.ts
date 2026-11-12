@@ -114,16 +114,38 @@ export class HiveLightAccessory extends HiveAccessoryBase<HiveLight> {
     }
   }
 
-  /** Narrow the Color Temperature slider to what the bulb supports. */
+  /**
+   * Narrow the Color Temperature slider to what the bulb supports.
+   *
+   * HAP checks the value already held against the new range, and the value a
+   * new characteristic starts with (140 mireds) is cooler than any Hive bulb
+   * goes — so it is moved into the range first, or every startup would log an
+   * "illegal value" warning for each tuneable light.
+   */
   private applyColourTemperatureRange(light: HiveLight): void {
     const range = light.colourTemperatureRange;
     if (!range) {
       return;
     }
-    this.service.getCharacteristic(this.platform.Characteristic.ColorTemperature).setProps({
-      minValue: kelvinToMireds(range.max),
-      maxValue: kelvinToMireds(range.min),
-    });
+    const characteristic = this.service.getCharacteristic(this.platform.Characteristic.ColorTemperature);
+    const minValue = kelvinToMireds(range.max);
+    const maxValue = kelvinToMireds(range.min);
+    const { props } = characteristic;
+    if (props.minValue === minValue && props.maxValue === maxValue) {
+      return;
+    }
+    const held = characteristic.value as number;
+    const inRange = Math.min(maxValue, Math.max(minValue, held));
+    const withinOld = inRange >= (props.minValue ?? -Infinity) && inRange <= (props.maxValue ?? Infinity);
+    // Moved before narrowing wherever the old range allows it, which covers
+    // every range Hive has been seen to report.
+    if (inRange !== held && withinOld) {
+      characteristic.updateValue(inRange);
+    }
+    characteristic.setProps({ minValue, maxValue });
+    if (inRange !== held && !withinOld) {
+      characteristic.updateValue(inRange);
+    }
   }
 
   /** The latest colour temperature in mireds, within the slider's range. */

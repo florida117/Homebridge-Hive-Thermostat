@@ -64,6 +64,17 @@ export const HIVE_MAX_TEMP = 32;
 export const HIVE_TEMP_STEP = 0.5;
 
 /**
+ * A target temperature from Hive, brought within the range HomeKit and Matter
+ * are told a target can take. Hive accepts targets only in that range, but
+ * what it reports back is not checked — a zone that is off may carry its
+ * frost-protection value — and outside the range HomeKit warns on every poll
+ * and Matter rejects the update outright, current temperature included.
+ */
+export function clampTarget(temp: number): number {
+  return Math.min(HIVE_MAX_TEMP, Math.max(HIVE_MIN_TEMP, temp));
+}
+
+/**
  * Battery level (percent) at or below which a battery-powered device (radiator
  * valve, sensor) reports low battery to HomeKit.
  */

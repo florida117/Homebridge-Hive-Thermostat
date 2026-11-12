@@ -111,12 +111,15 @@ const THERMOSTAT_HANDLERS = {
  * `rejects(accessory)` makes a registration fail the way a conformance error
  * does in Homebridge: silently, with the endpoint never coming online.
  *
+ * `throws(accessory)` makes a registration throw, as Homebridge does while its
+ * Matter server is still starting.
+ *
  * An endpoint restored from cache (see `restore()`) is adopted when the
  * plugin registers its UUID, as Homebridge 2.3 and later do. Registering any
  * other UUID that is still present is refused, as Homebridge refuses it
  * ("already registered").
  */
-function createMatter({ regime = '2.4', rejects = () => false } = {}) {
+function createMatter({ regime = '2.4', rejects = () => false, throws = () => false } = {}) {
   const endpoints = new Map();
   const calls = { registered: [], unregistered: [], conflicts: [] };
 
@@ -164,6 +167,9 @@ function createMatter({ regime = '2.4', rejects = () => false } = {}) {
     uuid: { generate: (name) => name },
     async registerPlatformAccessories(_plugin, _platform, accessories) {
       for (const accessory of accessories) {
+        if (throws(accessory)) {
+          throw new Error('the Matter server for this bridge is still starting');
+        }
         calls.registered.push(accessory.UUID);
         const existing = endpoints.get(accessory.UUID);
         if (existing && !existing.restored) {
