@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.2] - 2026-11-12
+
+### Fixed
+- **Radiator valves could show a charging status in the Home app**, though
+  they run on AA batteries. Radiator valves, and motion and door/window
+  sensors, now always report that their batteries are not chargeable.
+
 ## [1.3.1] - 2026-11-12
 
 ### Fixed

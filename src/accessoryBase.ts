@@ -110,8 +110,13 @@ export abstract class HiveAccessoryBase<State extends { online: boolean; battery
     service
       .getCharacteristic(Characteristic.StatusLowBattery)
       .onGet(() => this.guard(() => this.lowBattery()));
+    // Hive's battery devices take AA cells, so they can never charge. The
+    // value is stored as well as served: HAP answers a repeat /accessories
+    // request within 5s from the stored value, which otherwise stays at the
+    // default NOT_CHARGING and makes the Home app show a charging status.
     service
       .getCharacteristic(Characteristic.ChargingState)
+      .updateValue(Characteristic.ChargingState.NOT_CHARGEABLE)
       .onGet(() => Characteristic.ChargingState.NOT_CHARGEABLE);
   }
 

@@ -537,6 +537,12 @@ test('a radiator valve room is a thermostat with a battery, written to its own n
     await battery(valve, hap.Characteristic.StatusLowBattery).handleGetRequest(),
     hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW,
   );
+  // AA batteries: never chargeable. Checked as the stored value, which HAP
+  // sends instead of asking when the Home app reloads within 5s.
+  assert.equal(
+    battery(valve, hap.Characteristic.ChargingState).value,
+    hap.Characteristic.ChargingState.NOT_CHARGEABLE,
+  );
   assert.equal(heatingAccessory(homebridge).getService(hap.Service.Battery), undefined);
   assert.ok(log.messages('info').some((m) => m.includes('Discovered radiator valve "Bedroom"')));
 
@@ -600,6 +606,11 @@ test('a cached radiator valve is reused as one, keeping its Battery service and 
 
   assert.equal(homebridge.registered.length, 0, 'the cached accessory is reused');
   assert.equal(await battery(cached, hap.Characteristic.BatteryLevel).handleGetRequest(), 80);
+  assert.equal(
+    battery(cached, hap.Characteristic.ChargingState).value,
+    hap.Characteristic.ChargingState.NOT_CHARGEABLE,
+    'a cached Battery service starts at HAP\'s NOT_CHARGING until set',
+  );
   await characteristic(cached, hap.Characteristic.TargetTemperature).handleSetRequest(21);
   assert.deepEqual(writes, ['/1.0/nodes/trvcontrol/trv-room-1']);
 });
@@ -744,4 +755,74 @@ test('a kind of device turned off in the config is left out, and removed if cach
   assert.deepEqual(homebridge.unregistered, [cached]);
   assert.ok(byUuid(homebridge, 'hive-plug-plug-1'));
   assert.ok(byUuid(homebridge, 'hive-sensor-sensor-1'));
+});
+
+// ---- Stored values match what the plugin serves -----------------------------
+//
+// HAP answers an /accessories request that comes within 5s of the last one
+// from each characteristic's stored value, without calling its get handler.
+// A stored value left at HAP's default — or out of step with the handler —
+// is then what the Home app shows.
+
+/** Every Hive device type the plugin exposes, in states unlike HAP's defaults. */
+function everyDevice() {
+  return {
+    zones: [
+      h.zone({ mode: 'MANUAL', heating: true, currentTemperature: 18.5, targetTemperature: 21 }),
+      h.radiatorValve({ mode: 'OFF', battery: 15 }),
+    ],
+    hotWater: [h.hotWater({ on: true, boosting: true })],
+    plugs: [plug({ on: true, inUse: true })],
+    lights: [
+      light({ id: 'warm', type: 'warmwhitelight', on: true, brightness: 35, colourTemperature: undefined, colourTemperatureRange: undefined, colourMode: undefined, hue: undefined, saturation: undefined }),
+      light({ id: 'tune', type: 'tuneablelight', colourTemperature: 4000, colourMode: undefined, hue: undefined, saturation: undefined }),
+      light({ id: 'colour', colourMode: 'COLOUR', hue: 200, saturation: 90 }),
+    ],
+    sensors: [
+      sensor({ triggered: true, battery: 10 }),
+      sensor({ id: 'motion-1', type: 'motionsensor', name: 'Landing', triggered: true, battery: 60 }),
+    ],
+  };
+}
+
+/** Each readable characteristic whose stored value differs from its get handler's. */
+async function storedMismatches(accessories) {
+  const mismatches = [];
+  for (const accessory of accessories) {
+    for (const service of accessory.accessory.services) {
+      for (const c of service.characteristics) {
+        if (!c.props.perms.includes('pr')) {
+          continue;
+        }
+        // Read first: a get stores what it served, hiding the difference.
+        const stored = c.value;
+        const served = await c.handleGetRequest();
+        if (JSON.stringify(served) !== JSON.stringify(stored)) {
+          mismatches.push(`${accessory.displayName} / ${service.displayName} / ${c.displayName}: stored ${stored}, served ${served}`);
+        }
+      }
+    }
+  }
+  return mismatches;
+}
+
+test('every device\'s stored HomeKit values match what the plugin serves', async (t) => {
+  const { homebridge } = await launchDevices(t, everyDevice());
+  assert.equal(homebridge.registered.length, 9);
+
+  assert.deepEqual(await storedMismatches(homebridge.registered), []);
+});
+
+test('battery devices report that they cannot charge', async (t) => {
+  const { homebridge } = await launchDevices(t, everyDevice());
+  const withBattery = homebridge.registered.filter((a) => a.getService(hap.Service.Battery));
+
+  assert.deepEqual(withBattery.map((a) => a.displayName).sort(), ['Back Door', 'Bedroom', 'Landing']);
+  for (const accessory of withBattery) {
+    assert.equal(
+      battery(accessory, hap.Characteristic.ChargingState).value,
+      hap.Characteristic.ChargingState.NOT_CHARGEABLE,
+      accessory.displayName,
+    );
+  }
 });
