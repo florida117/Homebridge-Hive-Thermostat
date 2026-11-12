@@ -75,12 +75,40 @@ interface PoolConfig {
   clientId: string;
 }
 
-/** Thrown when login needs an SMS 2FA code to proceed. */
+/**
+ * A login waiting on its 2FA code.
+ *
+ * Cognito ties each code to the login attempt that sent it, which it names by
+ * an opaque session string. Starting another login sends a new code and makes
+ * the earlier one useless, so a code must be checked against this challenge —
+ * and the challenge must be stored to outlive a restart.
+ */
+export interface HiveMfaChallenge {
+  /** Cognito's own username for the account, as the login settled on it. */
+  username: string;
+  session: string;
+  type: 'SMS_MFA' | 'SOFTWARE_TOKEN_MFA';
+  /** Where Cognito sent the code, masked (e.g. +********1234), if it said. */
+  destination?: string;
+}
+
+/** Thrown when login needs a 2FA code to proceed. */
 export class HiveSmsRequired extends Error {
-  constructor() {
+  constructor(public readonly challenge: HiveMfaChallenge) {
     super('Hive login requires an SMS 2FA code.');
     this.name = 'HiveSmsRequired';
   }
+}
+
+/**
+ * Whether a failed 2FA submission means the challenge itself is finished —
+ * expired, or closed after too many wrong codes — so only a new login, with a
+ * new code, can go on. A CodeMismatchException is not one: the code was wrong,
+ * but the challenge still takes the right one.
+ */
+export function isChallengeExpired(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return code === 'NotAuthorizedException' || code === 'ExpiredCodeException';
 }
 
 /**
@@ -132,6 +160,7 @@ export class HiveAuth {
   private userPool?: CognitoUserPool;
   private cognitoUser?: CognitoUser;
   private readonly storage = new SessionStorage();
+  private challenge?: HiveMfaChallenge;
 
   constructor(
     private readonly username: string,
@@ -262,9 +291,10 @@ export class HiveAuth {
         onSuccess: (s) => resolve(s),
         onFailure: (err) => reject(err),
         // Hive uses SMS_MFA. submitSms() completes the challenge via
-        // cognitoUser.sendMFACode().
-        totpRequired: () => reject(new HiveSmsRequired()),
-        mfaRequired: () => reject(new HiveSmsRequired()),
+        // cognitoUser.sendMFACode(), against the session recorded here.
+        totpRequired: () => reject(new HiveSmsRequired(this.recordChallenge('SOFTWARE_TOKEN_MFA'))),
+        mfaRequired: (_name, params) =>
+          reject(new HiveSmsRequired(this.recordChallenge('SMS_MFA', params))),
         // Cognito settles authenticateUser through exactly one callback. Any
         // challenge we don't provide a handler for would leave this promise
         // pending forever and hang Homebridge startup with no explanation, so
@@ -304,26 +334,52 @@ export class HiveAuth {
     return this.tokensFromSession(session);
   }
 
+  private recordChallenge(
+    type: HiveMfaChallenge['type'],
+    params?: { CODE_DELIVERY_DESTINATION?: unknown },
+  ): HiveMfaChallenge {
+    const user = this.cognitoUser as (CognitoUser & { Session?: string | null }) | undefined;
+    const destination = params?.CODE_DELIVERY_DESTINATION;
+    this.challenge = {
+      username: user?.getUsername() ?? this.username,
+      session: user?.Session ?? '',
+      type,
+      destination: typeof destination === 'string' ? destination : undefined,
+    };
+    return this.challenge;
+  }
+
   /**
-   * Complete an MFA challenge with the SMS code the user received.
-   * Only valid immediately after login() threw HiveSmsRequired.
+   * Answer a 2FA challenge with the code the user received.
+   *
+   * `challenge` is the one login() raised — in this process, or stored from
+   * an earlier one. Left out, the challenge from the last login() is used.
    */
-  async submitSms(code: string): Promise<HiveTokens> {
-    if (!this.cognitoUser) {
+  async submitSms(code: string, challenge = this.challenge): Promise<HiveTokens> {
+    if (!challenge) {
       throw new Error('submitSms called before login.');
     }
+    const pool = await this.ensurePool();
+    const user = new CognitoUser({
+      Username: challenge.username,
+      Pool: pool,
+      Storage: this.storage,
+    }) as CognitoUser & { Session?: string | null };
+    user.Session = challenge.session;
+    this.cognitoUser = user;
 
     const session = await withTimeout(new Promise<CognitoUserSession>((resolve, reject) => {
-      this.cognitoUser!.sendMFACode(
+      user.sendMFACode(
         code.trim(),
         {
           onSuccess: (s) => resolve(s),
           onFailure: (err) => reject(err),
         },
-        'SMS_MFA',
+        challenge.type,
       );
     }), 'Hive 2FA verification');
 
+    this.challenge = undefined;
     return this.tokensFromSession(session);
   }
 

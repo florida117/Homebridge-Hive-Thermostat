@@ -44,6 +44,20 @@ export const STALE_AFTER_FAILED_POLLS = 3;
 export const STARTUP_RETRY_MIN_MS = 30_000;
 export const STARTUP_RETRY_MAX_MS = 30 * 60_000;
 
+/**
+ * How often to look in config.json for a 2FA code while a login waits on one,
+ * so the user can enter it and save without restarting Homebridge.
+ */
+export const CODE_WATCH_INTERVAL_MS = 3_000;
+
+/**
+ * The longest Cognito keeps a 2FA challenge open (its maximum auth session
+ * validity). A stored challenge older than this is certainly dead, so a
+ * restart starts a new login; a younger one is resumed rather than texting
+ * another code.
+ */
+export const MFA_CHALLENGE_MAX_AGE_MS = 15 * 60_000;
+
 /** Hive thermostat temperature bounds (Celsius). */
 export const HIVE_MIN_TEMP = 5;
 export const HIVE_MAX_TEMP = 32;

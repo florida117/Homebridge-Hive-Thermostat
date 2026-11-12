@@ -15,12 +15,14 @@ const TOKENS = { idToken: 'id', accessToken: 'access', refreshToken: 'refresh-2'
 const COMMUNICATION_FAILURE = hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE;
 const realFetch = globalThis.fetch;
 
-const { STARTUP_RETRY_MIN_MS } = settings;
+const { STARTUP_RETRY_MIN_MS, CODE_WATCH_INTERVAL_MS } = settings;
 beforeEach(() => {
   settings.STARTUP_RETRY_MIN_MS = 10;
+  settings.CODE_WATCH_INTERVAL_MS = 5;
 });
 after(() => {
   settings.STARTUP_RETRY_MIN_MS = STARTUP_RETRY_MIN_MS;
+  settings.CODE_WATCH_INTERVAL_MS = CODE_WATCH_INTERVAL_MS;
 });
 
 afterEach(() => {
@@ -53,11 +55,15 @@ function stubHive({
 }
 
 /** Construct the platform and let Homebridge finish launching. */
-function launch(t, { stored, cached = [], config = {} } = {}) {
+function launch(t, { stored, challenge, cached = [], config = {} } = {}) {
   const storagePath = h.tempStorage();
   const tokenFile = path.join(storagePath, '.hive-thermostat-tokens.json');
+  const challengeFile = path.join(storagePath, '.hive-thermostat-2fa.json');
   if (stored) {
     fs.writeFileSync(tokenFile, JSON.stringify(stored));
+  }
+  if (challenge) {
+    fs.writeFileSync(challengeFile, JSON.stringify(challenge));
   }
   const homebridge = h.createHomebridge({ storagePath });
   const log = h.createLog();
@@ -77,7 +83,19 @@ function launch(t, { stored, cached = [], config = {} } = {}) {
   }
   homebridge.emit('didFinishLaunching');
   t.after(() => homebridge.emit('shutdown'));
-  return { platform, homebridge, log, tokenFile };
+  /** Save a 2FA code in config.json, as the Homebridge UI does. */
+  const saveCode = (smsCode) =>
+    fs.writeFileSync(
+      path.join(storagePath, 'config.json'),
+      JSON.stringify({
+        bridge: {},
+        platforms: [
+          { platform: 'Other', username: 'me@example.com', smsCode: '000000' },
+          { platform: 'HiveThermostat', username: 'Me@Example.com', password: 'secret', smsCode },
+        ],
+      }),
+    );
+  return { platform, homebridge, log, tokenFile, challengeFile, saveCode };
 }
 
 function heatingAccessory(homebridge, accessories = homebridge.registered) {
@@ -295,22 +313,167 @@ test('a login that times out is not retried, since each attempt can text a 2FA c
   assert.match(log.messages('error')[0], /Hive login timed out.*restart Homebridge/);
 });
 
-test('a 2FA code that could not be submitted is not retried with a fresh login', async (t) => {
+// ---- 2FA ---------------------------------------------------------------------
+//
+// Cognito accepts a code only for the login that sent it, and every login
+// sends a new code. So a code is always checked against the stored challenge,
+// never sent to a fresh login.
+
+const { HiveSmsRequired } = require('../dist/hiveAuth');
+
+function challengeFrom(session) {
+  return { username: 'cognito-user', session, type: 'SMS_MFA', destination: '+********1234' };
+}
+
+/** Logins each raise a new challenge: s1, s2, … */
+function stubSmsLogin(submit = async () => TOKENS) {
+  let logins = 0;
   const hive = stubHive({
     login: async () => {
-      throw new (require('../dist/hiveAuth').HiveSmsRequired)();
+      throw new HiveSmsRequired(challengeFrom(`s${++logins}`));
     },
   });
-  mock.method(HiveAuth.prototype, 'submitSms', async () => {
-    throw networkError();
-  });
-  const { log } = launch(t, { config: { smsCode: '123456' } });
+  hive.submit = mock.method(HiveAuth.prototype, 'submitSms', submit);
+  return hive;
+}
 
-  await h.until(() => log.messages('error').length > 0);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+const submitted = (hive) => hive.submit.mock.calls.map((c) => [c.arguments[0], c.arguments[1].session]);
+
+test('a code saved in the config after the SMS is checked against that login, without a restart', async (t) => {
+  const hive = stubSmsLogin();
+  // The code from an earlier login is still in the config, as in issue #1.
+  const { homebridge, log, tokenFile, challengeFile, saveCode } =
+    launch(t, { config: { smsCode: '111111' } });
+
+  await h.until(() => fs.existsSync(challengeFile));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(hive.submit.mock.callCount(), 0, 'the stale code is never submitted');
+  assert.ok(log.messages('warn').some((m) => m.includes('sent to +********1234') && m.includes('no need to restart')));
+
+  saveCode(' 222 222 ');
+  await h.until(discovered(homebridge));
+
+  assert.deepEqual(submitted(hive), [['222222', 's1']]);
+  assert.equal(hive.login.mock.callCount(), 1);
+  assert.equal(fs.existsSync(challengeFile), false);
+  assert.equal(JSON.parse(fs.readFileSync(tokenFile, 'utf8')).refreshToken, 'refresh-2');
+});
+
+test('the 2FA challenge is stored privately', async (t) => {
+  stubSmsLogin();
+  const { challengeFile } = launch(t);
+
+  await h.until(() => fs.existsSync(challengeFile));
+
+  const stored = JSON.parse(fs.readFileSync(challengeFile, 'utf8'));
+  assert.equal(stored.challenge.session, 's1');
+  assert.equal(stored.username, 'me@example.com');
+  assert.equal(fs.statSync(challengeFile).mode & 0o777, 0o600);
+});
+
+test('a restart with the code in the config answers the stored login instead of starting another', async (t) => {
+  const hive = stubSmsLogin();
+  const { homebridge } = launch(t, {
+    config: { smsCode: '222222' },
+    challenge: { username: 'me@example.com', challenge: challengeFrom('s-before-restart'), sentAt: Date.now() - 60_000, staleCode: '111111' },
+  });
+
+  await h.until(discovered(homebridge));
+
+  assert.equal(hive.login.mock.callCount(), 0, 'no new SMS is sent');
+  assert.deepEqual(submitted(hive), [['222222', 's-before-restart']]);
+});
+
+test('a restart while still waiting for the code does not text another one', async (t) => {
+  const hive = stubSmsLogin();
+  const { log, saveCode, homebridge } = launch(t, {
+    config: { smsCode: '111111' },
+    challenge: { username: 'me@example.com', challenge: challengeFrom('s1'), sentAt: Date.now() - 60_000, staleCode: '111111' },
+  });
+
+  await h.until(() => log.messages('info').some((m) => m.includes('still waiting for the 2FA code')));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(hive.login.mock.callCount(), 0);
+  assert.equal(hive.submit.mock.callCount(), 0);
+
+  saveCode('222222');
+  await h.until(discovered(homebridge));
+  assert.deepEqual(submitted(hive), [['222222', 's1']]);
+});
+
+test('a stored challenge past Cognito\'s limit, or for another account, starts a new login', async (t) => {
+  for (const challenge of [
+    { username: 'me@example.com', challenge: challengeFrom('old'), sentAt: Date.now() - 16 * 60_000 },
+    { username: 'someone@else.com', challenge: challengeFrom('theirs'), sentAt: Date.now() },
+  ]) {
+    mock.restoreAll();
+    const hive = stubSmsLogin();
+    const { challengeFile } = launch(t, { challenge });
+
+    await h.until(() => hive.login.mock.callCount() === 1);
+    await h.until(() => JSON.parse(fs.readFileSync(challengeFile, 'utf8')).challenge.session === 's1');
+  }
+});
+
+test('a wrong code is reported and a corrected one is accepted on the same login', async (t) => {
+  const hive = stubSmsLogin(async (code) => {
+    if (code !== '222222') {
+      throw cognitoError('CodeMismatchException');
+    }
+    return TOKENS;
+  });
+  const { homebridge, log, saveCode } = launch(t);
+  await h.until(() => hive.login.mock.callCount() === 1);
+
+  saveCode('999999');
+  await h.until(() => log.messages('error').some((m) => /2FA code rejected/.test(m)));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(hive.submit.mock.callCount(), 1, 'a rejected code is not resent');
+
+  saveCode('222222');
+  await h.until(discovered(homebridge));
+  assert.deepEqual(submitted(hive), [['999999', 's1'], ['222222', 's1']]);
+  assert.equal(hive.login.mock.callCount(), 1);
+});
+
+test('a code for an expired login sends a new one, and that one is accepted', async (t) => {
+  const hive = stubSmsLogin(async (_code, challenge) => {
+    if (challenge.session === 's1') {
+      throw cognitoError('NotAuthorizedException');
+    }
+    return TOKENS;
+  });
+  const { homebridge, log, saveCode } = launch(t);
+  await h.until(() => hive.login.mock.callCount() === 1);
+
+  saveCode('222222');
+  await h.until(() => hive.login.mock.callCount() === 2);
+  assert.ok(log.messages('warn').some((m) => m.includes('expired')));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(hive.submit.mock.callCount(), 1, 'the expired code is not tried on the new login');
+
+  saveCode('333333');
+  await h.until(discovered(homebridge));
+  assert.deepEqual(submitted(hive), [['222222', 's1'], ['333333', 's2']]);
+});
+
+test('a 2FA code that could not be submitted is retried, not sent to a fresh login', async (t) => {
+  let attempts = 0;
+  const hive = stubSmsLogin(async () => {
+    if (attempts++ === 0) {
+      throw networkError();
+    }
+    return TOKENS;
+  });
+  const { homebridge, log, saveCode } = launch(t);
+  await h.until(() => hive.login.mock.callCount() === 1);
+
+  saveCode('222222');
+  await h.until(discovered(homebridge));
 
   assert.equal(hive.login.mock.callCount(), 1);
-  assert.match(log.messages('error')[0], /could not submit the 2FA code/);
+  assert.deepEqual(submitted(hive), [['222222', 's1'], ['222222', 's1']]);
+  assert.ok(log.messages('warn').some((m) => /could not submit the 2FA code/.test(m)));
 });
 
 test('without credentials, cached accessories still report No Response', async (t) => {

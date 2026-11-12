@@ -135,3 +135,27 @@ test('each plugin instance keeps its own Cognito state', async () => {
 
   assert.equal(second.device(), undefined);
 });
+
+test('a 2FA code is answered on the stored login, under Cognito\'s own username', async () => {
+  const calls = fakeCognito();
+  const auth = new HiveAuth('me@example.com', 'secret', h.createLog());
+
+  await auth.submitSms(' 123456 ', {
+    username: 'cognito-user',
+    session: 'session-from-before-restart',
+    type: 'SMS_MFA',
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target, 'AWSCognitoIdentityProviderService.RespondToAuthChallenge');
+  assert.equal(calls[0].body.ChallengeName, 'SMS_MFA');
+  assert.equal(calls[0].body.Session, 'session-from-before-restart');
+  assert.deepEqual(calls[0].body.ChallengeResponses, { USERNAME: 'cognito-user', SMS_MFA_CODE: '123456' });
+});
+
+test('a code for a dead challenge is told apart from a wrong one', () => {
+  const { isChallengeExpired } = require('../dist/hiveAuth');
+  assert.equal(isChallengeExpired(cognitoError('NotAuthorizedException')), true);
+  assert.equal(isChallengeExpired(cognitoError('ExpiredCodeException')), true);
+  assert.equal(isChallengeExpired(cognitoError('CodeMismatchException')), false);
+});

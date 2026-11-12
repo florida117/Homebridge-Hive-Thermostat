@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.1] - 2026-11-12
+
+### Fixed
+- **SMS 2FA codes were always rejected** with "2FA code rejected (Invalid
+  code or auth state for the user.)" (#1, #6). Hive accepts a code only for
+  the sign-in attempt that sent it, but the plugin checked the code after a
+  restart, by which time it had started a new sign-in and texted a different
+  code. Every restart repeated this, so setup could never finish.
+  - Enter the code in the **2FA Code** field and click **Save**; there is no
+    need to restart. The plugin picks the code up within a few seconds.
+  - A restart while waiting for a code no longer sends a new one; the plugin
+    keeps waiting for the code already sent.
+  - A code left in the config from an earlier attempt is ignored rather than
+    submitted.
+  - A wrong code can be corrected and saved again. A code that has expired
+    makes the plugin send a new one.
+
+If you are stuck on this error: update, restart Homebridge once, then enter
+the code from the new SMS and click Save.
+
 ## [1.3.0] - 2026-11-12
 
 ### Added

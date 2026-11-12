@@ -143,10 +143,17 @@ Use the Homebridge UI settings form, or add a platform block to `config.json`:
 
 1. Enter your **username** and **password**, save, and restart Homebridge.
 2. If your account has SMS 2FA, the log will prompt:
-   *"Hive requires SMS two-factor authentication…"* and a code will be texted to you.
-3. Put that code in the **2FA Code** (`smsCode`) field, save, and restart again.
+   *"Hive requires two-factor authentication…"* and a code will be texted to you.
+3. Put that code in the **2FA Code** (`smsCode`) field and click **Save**.
+   **Don't restart** — the plugin picks the code up from the config within a few
+   seconds. Codes expire after a few minutes, so enter it promptly.
 4. Once it logs *"2FA accepted"*, you can clear the 2FA Code field. The refresh
    token is stored so future restarts don't need it.
+
+Each code works only for the sign-in attempt that sent it. If you restart
+before entering the code, the plugin carries on waiting for that same code
+rather than sending a new one. If a code has expired, entering it makes the
+plugin send a fresh one; enter that one instead.
 
 If the refresh token is ever rejected (Hive occasionally invalidates them
 server-side), you'll see a re-authentication message in the log and need to

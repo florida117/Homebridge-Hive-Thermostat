@@ -3,9 +3,14 @@
  *
  * Auth lifecycle (designed around Homebridge's static config UI):
  *   1. User enters username + password, saves, restarts.
- *   2. If the account has SMS 2FA, the platform logs a clear prompt and waits.
- *      The user reads the SMS, puts the code in the `smsCode` config field,
- *      and restarts again.
+ *   2. If the account has SMS 2FA, the platform logs a clear prompt and waits,
+ *      watching config.json. The user reads the SMS, puts the code in the
+ *      `smsCode` config field and saves — no restart needed.
+ *
+ *      Cognito accepts a code only for the login attempt that sent it, and
+ *      every new login sends a new code. So the waiting challenge is stored,
+ *      and a restart resumes it instead of logging in again; a code already in
+ *      the config when a login began belongs to an older one and is ignored.
  *   3. On success the refresh token is persisted to disk; subsequent restarts
  *      silently refresh and never need the SMS field again. The user can clear
  *      smsCode afterwards.
@@ -28,7 +33,9 @@ import path from 'path';
 import {
   PLATFORM_NAME,
   PLUGIN_NAME,
+  CODE_WATCH_INTERVAL_MS,
   DEFAULT_POLL_INTERVAL_MS,
+  MFA_CHALLENGE_MAX_AGE_MS,
   MIN_POLL_INTERVAL_MS,
   STALE_AFTER_FAILED_POLLS,
   STARTUP_RETRY_MAX_MS,
@@ -38,8 +45,10 @@ import {
   HiveAuth,
   HiveAuthActionRequired,
   HiveDevice,
+  HiveMfaChallenge,
   HiveSmsRequired,
   HiveTokens,
+  isChallengeExpired,
   isTransientAuthError,
 } from './hiveAuth';
 import { HiveTimeoutError } from './timeout';
@@ -97,6 +106,20 @@ interface StoredTokens {
   device?: unknown;
 }
 
+/** What `.hive-thermostat-2fa.json` holds: a login waiting on its 2FA code. */
+interface PendingChallenge {
+  /** The configured account, so a challenge never crosses accounts. */
+  username: string;
+  challenge: HiveMfaChallenge;
+  /** When the code was sent (ms since the epoch). */
+  sentAt: number;
+  /**
+   * The code in the config when this login began. It was sent for an earlier
+   * login, so it is never submitted to this one.
+   */
+  staleCode?: string;
+}
+
 /** What a usable token file yields. */
 interface StoredSession {
   refreshToken: string;
@@ -116,6 +139,12 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
   private readonly tokenStorePath: string;
   private readonly legacyPresetsStorePath: string;
+  private readonly challengeStorePath: string;
+  /** The login waiting on a 2FA code, if any. */
+  private pending?: PendingChallenge;
+  /** The last code submitted to `pending`, so a rejected one is not resent. */
+  private lastTriedCode?: string;
+  private codeWatchTimer?: NodeJS.Timeout;
   private pollTimer?: NodeJS.Timeout;
   private pollSoonTimer?: NodeJS.Timeout;
   private startupRetryTimer?: NodeJS.Timeout;
@@ -197,6 +226,11 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       '.hive-thermostat-matter.json',
     );
 
+    this.challengeStorePath = path.join(
+      this.homebridgeApi.user.storagePath(),
+      '.hive-thermostat-2fa.json',
+    );
+
     const configured = !!this.cfg.username && !!this.cfg.password;
     if (!configured) {
       this.log.error(
@@ -218,6 +252,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       clearInterval(this.pollTimer);
       clearTimeout(this.pollSoonTimer);
       clearTimeout(this.startupRetryTimer);
+      clearTimeout(this.codeWatchTimer);
     });
   }
 
@@ -276,7 +311,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     });
 
     this.auth ??= new HiveAuth(this.cfg.username!, this.cfg.password!, this.log);
-    if (!(await this.authenticate())) {
+    // Tokens are already in hand when a 2FA code has just been accepted, or
+    // when an earlier attempt signed in and then failed to reach Hive.
+    if (!this.tokens && !(await this.authenticate())) {
       return; // waiting on the user to supply an SMS code
     }
 
@@ -323,9 +360,35 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       }
     }
 
-    // 2. No usable token — do a fresh login (which may need SMS 2FA).
+    // 2. A login from before a restart may still be waiting on its code.
+    //    Logging in again would text a new code and void the one the user
+    //    may be reading right now.
+    const pending = await this.loadChallenge();
+    if (pending) {
+      this.pending = pending;
+      const sent = new Date(pending.sentAt).toLocaleTimeString();
+      this.log.info(`Hive: still waiting for the 2FA code sent at ${sent}.`);
+      return this.awaitSmsCode();
+    }
+
+    // 3. No usable token — do a fresh login (which may need SMS 2FA). A code
+    //    already in the config was sent for some earlier login.
+    if (await this.freshLogin(normaliseCode(this.cfg.smsCode))) {
+      return true;
+    }
+    return this.awaitSmsCode();
+  }
+
+  /**
+   * Log in with the password. Resolves true when signed in, false when Hive
+   * texted a 2FA code — the challenge is then stored as `pending`.
+   *
+   * `staleCode` is a code the user has already entered for an earlier login,
+   * never to be submitted to this one.
+   */
+  private async freshLogin(staleCode?: string): Promise<boolean> {
     try {
-      this.tokens = await auth.login();
+      this.tokens = await this.auth!.login();
       this.log.info('Hive: logged in (no 2FA required).');
       return true;
     } catch (err) {
@@ -341,36 +404,175 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       if (!(err instanceof HiveSmsRequired)) {
         throw err;
       }
-    }
-    return this.handleSmsChallenge();
-  }
-
-  private async handleSmsChallenge(): Promise<boolean> {
-    if (!this.cfg.smsCode) {
+      this.pending = {
+        username: this.cfg.username!,
+        challenge: err.challenge,
+        sentAt: Date.now(),
+        staleCode,
+      };
+      this.lastTriedCode = undefined;
+      await this.saveChallenge(this.pending);
+      const to = err.challenge.destination ? ` to ${err.challenge.destination}` : '';
       this.log.warn(
         '============================================================\n' +
-          'Hive requires SMS two-factor authentication.\n' +
-          'A code has been sent to your phone. Enter it in the plugin\n' +
-          'config "smsCode" field and restart Homebridge.\n' +
+          'Hive requires two-factor authentication.\n' +
+          `A code has been sent${to}. Enter it in the plugin's\n` +
+          '"2FA Code" field and click Save. There is no need to restart:\n' +
+          'the plugin picks the code up within a few seconds.\n' +
+          'Codes expire after a few minutes.\n' +
           '============================================================',
       );
       return false;
     }
-    try {
-      this.tokens = await this.auth!.submitSms(this.cfg.smsCode);
-      this.log.info('Hive: 2FA accepted. You can now clear the smsCode field.');
+  }
+
+  /**
+   * Try the configured code against the pending challenge, and if it is not
+   * accepted, watch config.json for one. Resolves true when signed in.
+   */
+  private async awaitSmsCode(): Promise<boolean> {
+    if (await this.trySmsCode(this.cfg.smsCode)) {
       return true;
+    }
+    this.watchConfigForCode();
+    return false;
+  }
+
+  /**
+   * Submit `code` to the pending challenge, unless it is empty, belongs to an
+   * earlier login, or was already tried. Resolves true when signed in.
+   */
+  private async trySmsCode(entered: string | undefined): Promise<boolean> {
+    const pending = this.pending!;
+    const code = normaliseCode(entered);
+    if (!code || code === pending.staleCode || code === this.lastTriedCode) {
+      return false;
+    }
+    this.lastTriedCode = code;
+
+    try {
+      this.tokens = await this.auth!.submitSms(code, pending.challenge);
     } catch (err) {
-      // Never retried, whatever the cause: a retry starts a fresh login, which
-      // texts a new code and makes the configured one stale.
+      const message = (err as Error).message;
+      if (isTransientAuthError(err)) {
+        // Submitting again sends no SMS, so the next look at the config
+        // tries the same code again.
+        this.lastTriedCode = undefined;
+        this.log.warn(`Hive: could not submit the 2FA code (${message}). Trying again shortly.`);
+        return false;
+      }
+      if (isChallengeExpired(err)) {
+        // Only a new login can go on, and it sends a new code. The user has
+        // just entered one, so they are there to read it.
+        this.log.warn(
+          `Hive: that 2FA code has expired (${message}). Sending a new one.`,
+        );
+        return this.freshLogin(code);
+      }
+      // CodeMismatchException, or anything else about the code itself: the
+      // challenge still stands, so wait for a corrected code.
       this.log.error(
-        isTransientAuthError(err)
-          ? `Hive: could not submit the 2FA code (${(err as Error).message}). ` +
-              'Restart Homebridge to try again; you may need a new code.'
-          : `Hive: 2FA code rejected (${(err as Error).message}). ` +
-              'Request a new code and update the smsCode field.',
+        `Hive: 2FA code rejected (${message}). Check it against the latest ` +
+          'SMS from Hive, enter it in the "2FA Code" field and click Save.',
       );
       return false;
+    }
+
+    this.pending = undefined;
+    this.lastTriedCode = undefined;
+    await fs.unlink(this.challengeStorePath).catch(() => {
+      /* already gone */
+    });
+    this.log.info('Hive: 2FA accepted. You can now clear the smsCode field.');
+    return true;
+  }
+
+  /**
+   * Look in config.json every few seconds for a new 2FA code, so the user can
+   * enter it and save without restarting — a restart is just more time for
+   * the code to expire. Signs in and carries on with startup once accepted.
+   */
+  private watchConfigForCode(): void {
+    if (this.codeWatchTimer || this.shuttingDown) {
+      return;
+    }
+    const tick = async () => {
+      this.codeWatchTimer = undefined;
+      if (this.shuttingDown || !this.pending) {
+        return;
+      }
+      let signedIn: boolean;
+      try {
+        signedIn = await this.trySmsCode(await this.readConfiguredCode());
+      } catch (err) {
+        this.log.error(`Hive startup failed: ${(err as Error).message}`);
+        return;
+      }
+      if (signedIn) {
+        this.startup();
+      } else if (!this.shuttingDown) {
+        this.codeWatchTimer = setTimeout(() => void tick(), CODE_WATCH_INTERVAL_MS);
+      }
+    };
+    this.codeWatchTimer = setTimeout(() => void tick(), CODE_WATCH_INTERVAL_MS);
+  }
+
+  /** The smsCode saved for this account in config.json right now. */
+  private async readConfiguredCode(): Promise<string | undefined> {
+    let config: { platforms?: unknown };
+    try {
+      config = JSON.parse(await fs.readFile(this.homebridgeApi.user.configPath(), 'utf8'));
+    } catch {
+      return undefined; // unreadable, or caught mid-save; look again next time
+    }
+    if (!Array.isArray(config.platforms)) {
+      return undefined;
+    }
+    const account = normaliseUsername(this.cfg.username!);
+    const mine = (config.platforms as Record<string, unknown>[]).find(
+      (p) =>
+        (p?.platform === PLATFORM_NAME || p?.platform === `${PLUGIN_NAME}.${PLATFORM_NAME}`) &&
+        typeof p.username === 'string' &&
+        normaliseUsername(p.username) === account,
+    );
+    return typeof mine?.smsCode === 'string' ? mine.smsCode : undefined;
+  }
+
+  /** The stored challenge, if it is this account's and may still be open. */
+  private async loadChallenge(): Promise<PendingChallenge | undefined> {
+    let stored: Partial<PendingChallenge>;
+    try {
+      stored = JSON.parse(await fs.readFile(this.challengeStorePath, 'utf8'));
+    } catch {
+      return undefined;
+    }
+    const challenge = stored.challenge as Partial<HiveMfaChallenge> | undefined;
+    if (
+      typeof stored.username !== 'string' ||
+      normaliseUsername(stored.username) !== normaliseUsername(this.cfg.username!) ||
+      typeof stored.sentAt !== 'number' ||
+      Date.now() - stored.sentAt > MFA_CHALLENGE_MAX_AGE_MS ||
+      typeof challenge?.username !== 'string' ||
+      typeof challenge.session !== 'string' ||
+      (challenge.type !== 'SMS_MFA' && challenge.type !== 'SOFTWARE_TOKEN_MFA')
+    ) {
+      return undefined;
+    }
+    return {
+      username: stored.username,
+      challenge: challenge as HiveMfaChallenge,
+      sentAt: stored.sentAt,
+      staleCode: typeof stored.staleCode === 'string' ? stored.staleCode : undefined,
+    };
+  }
+
+  /** Store the challenge so a restart can resume it; readable by Homebridge alone. */
+  private async saveChallenge(pending: PendingChallenge): Promise<void> {
+    try {
+      await fs.writeFile(this.challengeStorePath, JSON.stringify(pending), { mode: 0o600 });
+      await fs.chmod(this.challengeStorePath, 0o600);
+    } catch (err) {
+      this.log.warn(`Hive: could not store the 2FA challenge: ${(err as Error).message}`);
     }
   }
 
@@ -1007,4 +1209,9 @@ function heatingTypeOf(accessory: PlatformAccessory): HiveHeatingType {
 /** Email addresses compare case-insensitively, and config fields pick up stray spaces. */
 function normaliseUsername(username: string): string {
   return username.trim().toLowerCase();
+}
+
+/** A 2FA code as typed, without the spaces people paste in with it. */
+function normaliseCode(code: unknown): string | undefined {
+  return typeof code === 'string' ? code.replace(/\s+/g, '') || undefined : undefined;
 }

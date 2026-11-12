@@ -71,7 +71,7 @@ function createHomebridge({ storagePath = tempStorage(), matter } = {}) {
   const api = {
     hap,
     platformAccessory: PlatformAccessory,
-    user: { storagePath: () => storagePath },
+    user: { storagePath: () => storagePath, configPath: () => path.join(storagePath, 'config.json') },
     registered: [],
     unregistered: [],
     on(event, listener) {
