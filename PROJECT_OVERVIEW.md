@@ -84,9 +84,24 @@ The login sequence is:
    A refresh that fails only because Hive or Cognito could not be reached is
    retried with the same token instead — falling through to a login would text
    the user a 2FA code they did not ask for.
-4. If Hive requires SMS MFA, log a clear setup prompt.
-5. The user enters the SMS code into the Homebridge config field `smsCode` and restarts Homebridge.
-6. The plugin submits that SMS code, receives tokens, and stores the refresh token for future restarts.
+4. If a stored 2FA challenge (`.hive-thermostat-2fa.json`) for this account is
+   less than 15 minutes old, resume it instead of logging in — a new login
+   would text a new code and void the one the user may be reading.
+5. If Hive requires SMS MFA, store the challenge (Cognito's session string)
+   and log a clear setup prompt. A code already in the config is recorded as
+   stale: it was sent for an earlier login.
+6. The user enters the SMS code into the Homebridge config field `smsCode` and
+   saves. The plugin re-reads `config.json` every few seconds while waiting, so
+   no restart is needed.
+7. The plugin submits that code against the stored challenge, receives tokens,
+   and stores the refresh token for future restarts. A wrong code
+   (`CodeMismatchException`) leaves the challenge open for a corrected one; an
+   expired challenge (`NotAuthorizedException`) starts a new login, which
+   texts a new code.
+
+Before 1.3.1 the code was submitted after a restart, to a new login that had
+just texted a different code, so Cognito always rejected it ("Invalid code or
+auth state for the user").
 
 Only the refresh token is persisted, with the username it belongs to: Cognito's
 refresh flow does not check the account, so a token from a previous account
