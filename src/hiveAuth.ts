@@ -13,6 +13,7 @@ import {
   AuthenticationDetails,
   CognitoUserSession,
   CognitoRefreshToken,
+  ICognitoStorage,
 } from 'amazon-cognito-identity-js';
 import type { Logger } from 'homebridge';
 import { HIVE_URLS, HIVE_USER_AGENT } from './settings';
@@ -22,6 +23,51 @@ export interface HiveTokens {
   idToken: string;
   accessToken: string;
   refreshToken: string;
+}
+
+/**
+ * The device Cognito registered for this plugin at login.
+ *
+ * Hive's user pool tracks devices: a login issues a device key along with the
+ * tokens, and the refresh token is bound to it. Cognito rejects that refresh
+ * token ("Invalid Refresh Token") unless the device key comes with it. The
+ * Cognito SDK keeps the key only in memory, so it has to be stored with the
+ * refresh token to survive a restart — as pyhiveapi does.
+ */
+export interface HiveDevice {
+  /** Cognito's own username for the account, which the SDK files devices under. */
+  username: string;
+  key: string;
+  groupKey: string;
+  /** The device's own SRP password, generated at registration. */
+  password: string;
+}
+
+/**
+ * Where the Cognito SDK keeps session and device state for this plugin.
+ *
+ * The SDK's default on Node is one in-memory store shared by everything in
+ * the process. Owning it instead lets the device be read out after a login
+ * and put back before a refresh.
+ */
+class SessionStorage implements ICognitoStorage {
+  private readonly items = new Map<string, string>();
+
+  setItem(key: string, value: string): void {
+    this.items.set(key, value);
+  }
+
+  getItem(key: string): string | null {
+    return this.items.get(key) ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.items.delete(key);
+  }
+
+  clear(): void {
+    this.items.clear();
+  }
 }
 
 interface PoolConfig {
@@ -85,6 +131,7 @@ export class HiveAuth {
   private poolConfig?: PoolConfig;
   private userPool?: CognitoUserPool;
   private cognitoUser?: CognitoUser;
+  private readonly storage = new SessionStorage();
 
   constructor(
     private readonly username: string,
@@ -140,8 +187,57 @@ export class HiveAuth {
     this.userPool = new CognitoUserPool({
       UserPoolId: cfg.poolId,
       ClientId: cfg.clientId,
+      Storage: this.storage,
     });
     return this.userPool;
+  }
+
+  private newUser(pool: CognitoUserPool): CognitoUser {
+    return new CognitoUser({ Username: this.username, Pool: pool, Storage: this.storage });
+  }
+
+  /** The SDK's storage keys, as CognitoUser builds them. */
+  private storageKeys(clientId: string, username = '') {
+    const prefix = `CognitoIdentityServiceProvider.${clientId}`;
+    return {
+      lastUser: `${prefix}.LastAuthUser`,
+      deviceKey: `${prefix}.${username}.deviceKey`,
+      groupKey: `${prefix}.${username}.deviceGroupKey`,
+      password: `${prefix}.${username}.randomPasswordKey`,
+    };
+  }
+
+  /**
+   * The device Cognito registered at the last login, for the caller to store
+   * with the refresh token. Undefined before any login, or if Hive's pool
+   * issued no device.
+   */
+  device(): HiveDevice | undefined {
+    if (!this.poolConfig) {
+      return undefined;
+    }
+    const { clientId } = this.poolConfig;
+    const username = this.storage.getItem(this.storageKeys(clientId).lastUser);
+    if (!username) {
+      return undefined;
+    }
+    const keys = this.storageKeys(clientId, username);
+    const key = this.storage.getItem(keys.deviceKey);
+    const groupKey = this.storage.getItem(keys.groupKey);
+    const password = this.storage.getItem(keys.password);
+    if (!key || !groupKey || !password) {
+      return undefined;
+    }
+    return { username, key, groupKey, password };
+  }
+
+  /** Put a stored device back where the SDK looks for it on refresh. */
+  private restoreDevice(clientId: string, device: HiveDevice): void {
+    const keys = this.storageKeys(clientId, device.username);
+    this.storage.setItem(keys.lastUser, device.username);
+    this.storage.setItem(keys.deviceKey, device.key);
+    this.storage.setItem(keys.groupKey, device.groupKey);
+    this.storage.setItem(keys.password, device.password);
   }
 
   /**
@@ -152,11 +248,9 @@ export class HiveAuth {
   async login(): Promise<HiveTokens> {
     const pool = await this.ensurePool();
 
-    this.cognitoUser = new CognitoUser({
-      Username: this.username,
-      Pool: pool,
-    });
-    // SRP requires USER_SRP_AUTH; the SDK does this by default.
+    this.cognitoUser = this.newUser(pool);
+    // SRP requires USER_SRP_AUTH; the SDK does this by default. If Hive issues
+    // a device, the SDK confirms it and files it in this.storage; see device().
 
     const authDetails = new AuthenticationDetails({
       Username: this.username,
@@ -236,10 +330,17 @@ export class HiveAuth {
   /**
    * Restore a session from a previously stored refresh token, getting fresh
    * id/access tokens without any user interaction.
+   *
+   * `device` is the one stored with the token, needed after a restart; see
+   * HiveDevice. Within a process the device from the last login is already in
+   * place, so later refreshes can leave it out.
    */
-  async refreshFromToken(refreshToken: string): Promise<HiveTokens> {
+  async refreshFromToken(refreshToken: string, device?: HiveDevice): Promise<HiveTokens> {
     const pool = await this.ensurePool();
-    this.cognitoUser = new CognitoUser({ Username: this.username, Pool: pool });
+    if (device) {
+      this.restoreDevice(pool.getClientId(), device);
+    }
+    this.cognitoUser = this.newUser(pool);
 
     const token = new CognitoRefreshToken({ RefreshToken: refreshToken });
 

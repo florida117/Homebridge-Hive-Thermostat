@@ -37,6 +37,7 @@ import {
 import {
   HiveAuth,
   HiveAuthActionRequired,
+  HiveDevice,
   HiveSmsRequired,
   HiveTokens,
   isTransientAuthError,
@@ -68,6 +69,18 @@ interface StoredTokens {
   refreshToken?: unknown;
   /** Absent in files written by 1.0.9 and earlier. */
   username?: unknown;
+  /**
+   * The Cognito device the refresh token is bound to; see HiveDevice. Absent
+   * in files written by 1.2.0 and earlier, whose tokens therefore never
+   * survived a restart.
+   */
+  device?: unknown;
+}
+
+/** What a usable token file yields. */
+interface StoredSession {
+  refreshToken: string;
+  device?: HiveDevice;
 }
 
 export class HiveThermostatPlatform implements DynamicPlatformPlugin {
@@ -249,6 +262,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
 
     await this.saveRefreshToken(this.tokens!.refreshToken);
+    this.log.debug(
+      `Hive: session stored ${this.auth.device() ? 'with' : 'without'} a Cognito device.`,
+    );
 
     this.api = new HiveApi(() => this.tokens!.idToken, this.log);
 
@@ -270,7 +286,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     const stored = await this.loadRefreshToken();
     if (stored) {
       try {
-        this.tokens = await auth.refreshFromToken(stored);
+        this.tokens = await auth.refreshFromToken(stored.refreshToken, stored.device);
         this.log.info('Hive: restored session from stored refresh token.');
         return true;
       } catch (err) {
@@ -350,7 +366,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
    * username was recorded are trusted, rather than costing every upgrading
    * user a fresh SMS code.
    */
-  private async loadRefreshToken(): Promise<string | undefined> {
+  private async loadRefreshToken(): Promise<StoredSession | undefined> {
     let stored: StoredTokens;
     try {
       stored = JSON.parse(await fs.readFile(this.tokenStorePath, 'utf8'));
@@ -367,14 +383,23 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       this.log.info('Hive: the stored session belongs to a different account; signing in again.');
       return undefined;
     }
-    return stored.refreshToken;
+    return { refreshToken: stored.refreshToken, device: parseDevice(stored.device) };
   }
 
+  /**
+   * Store the refresh token with the Cognito device it is bound to, without
+   * which Hive rejects it after a restart (see HiveDevice). The file holds
+   * credentials, so it is readable by the Homebridge user alone.
+   */
   private async saveRefreshToken(refreshToken: string): Promise<void> {
     try {
       await fs.writeFile(
         this.tokenStorePath,
-        JSON.stringify({ refreshToken, username: this.cfg.username }),
+        JSON.stringify({
+          refreshToken,
+          username: this.cfg.username,
+          device: this.auth?.device(),
+        }),
         { mode: 0o600 },
       );
       await fs.chmod(this.tokenStorePath, 0o600);
@@ -786,6 +811,25 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       return false;
     }
   }
+}
+
+/** A stored device, if the file holds a complete one. */
+function parseDevice(value: unknown): HiveDevice | undefined {
+  const device = value as Partial<Record<keyof HiveDevice, unknown>> | null | undefined;
+  if (
+    typeof device?.username === 'string' &&
+    typeof device.key === 'string' &&
+    typeof device.groupKey === 'string' &&
+    typeof device.password === 'string'
+  ) {
+    return {
+      username: device.username,
+      key: device.key,
+      groupKey: device.groupKey,
+      password: device.password,
+    };
+  }
+  return undefined;
 }
 
 /**
