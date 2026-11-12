@@ -5,7 +5,9 @@
  *   1. User enters username + password, saves, restarts.
  *   2. If the account has SMS 2FA, the platform logs a clear prompt and waits,
  *      watching config.json. The user reads the SMS, puts the code in the
- *      `smsCode` config field and saves — no restart needed.
+ *      `smsCode` config field and saves — no restart needed, though the
+ *      Homebridge UI asks for one after every save. Restarting does no harm:
+ *      the waiting login is resumed (below).
  *
  *      Cognito accepts a code only for the login attempt that sent it, and
  *      every new login sends a new code. So the waiting challenge is stored,
@@ -14,6 +16,8 @@
  *   3. On success the refresh token is persisted to disk; subsequent restarts
  *      silently refresh and never need the SMS field again. The user can clear
  *      smsCode afterwards.
+ *   4. If Hive later rejects the session outright, the platform signs in again
+ *      by itself, which may text a new code — step 2 again, without a restart.
  */
 
 import {
@@ -163,10 +167,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   /** Polls that have failed in a row; see STALE_AFTER_FAILED_POLLS. */
   private failedPolls = 0;
   /**
-   * Whether the standing token-refresh failure has already been reported, so a
-   * permanently rejected refresh token does not log an error every poll.
+   * Whether a failed Matter registration has already been reported, so one
+   * that keeps failing is retried every poll without an error every poll.
    */
-  private authFailureReported = false;
+  private matterFailureReported = false;
   /** The refresh in flight, shared by every caller that hits a 401 meanwhile. */
   private refreshing?: Promise<boolean>;
   private readonly pollIntervalMs: number;
@@ -322,7 +326,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       `Hive: session stored ${this.auth.device() ? 'with' : 'without'} a Cognito device.`,
     );
 
-    this.api = new HiveApi(() => this.tokens!.idToken, this.log);
+    // Also reached when signing in again after Hive rejected the session (see
+    // signOut()), with discovery done and polling already running.
+    this.api ??= new HiveApi(() => {
+      if (!this.tokens) {
+        throw new Error('Hive is signed out; waiting to sign in again.');
+      }
+      return this.tokens.idToken;
+    }, this.log);
 
     await this.discoverDevices();
     this.startPolling();
@@ -372,8 +383,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     }
 
     // 3. No usable token — do a fresh login (which may need SMS 2FA). A code
-    //    already in the config was sent for some earlier login.
-    if (await this.freshLogin(normaliseCode(this.cfg.smsCode))) {
+    //    already in the config was sent for some earlier login. The config as
+    //    saved now, since this can run long after startup (see signOut()).
+    const configured = await this.readConfiguredCode();
+    if (await this.freshLogin(normaliseCode(configured ?? this.cfg.smsCode))) {
       return true;
     }
     return this.awaitSmsCode();
@@ -417,8 +430,10 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         '============================================================\n' +
           'Hive requires two-factor authentication.\n' +
           `A code has been sent${to}. Enter it in the plugin's\n` +
-          '"2FA Code" field and click Save. There is no need to restart:\n' +
-          'the plugin picks the code up within a few seconds.\n' +
+          '"2FA Code" field and click Save. The plugin picks the code up\n' +
+          'within a few seconds. Homebridge UI will then say a restart is\n' +
+          'required: there is no need, so you can click Close. (Restarting\n' +
+          'does no harm either; the plugin carries on with the same code.)\n' +
           'Codes expire after a few minutes.\n' +
           '============================================================',
       );
@@ -483,7 +498,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     await fs.unlink(this.challengeStorePath).catch(() => {
       /* already gone */
     });
-    this.log.info('Hive: 2FA accepted. You can now clear the smsCode field.');
+    this.log.info('Hive: 2FA accepted. You can now clear the 2FA Code field.');
     return true;
   }
 
@@ -501,12 +516,22 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       if (this.shuttingDown || !this.pending) {
         return;
       }
-      let signedIn: boolean;
+      let signedIn = false;
       try {
         signedIn = await this.trySmsCode(await this.readConfiguredCode());
       } catch (err) {
-        this.log.error(`Hive startup failed: ${(err as Error).message}`);
-        return;
+        // Only the new login started for an expired code can throw here. If
+        // it never reached Cognito, nothing was sent: forget the code was
+        // tried, so the next look finds the challenge still expired and
+        // starts that login again.
+        if (!isTransientAuthError(err)) {
+          this.log.error(`Hive startup failed: ${(err as Error).message}`);
+          return;
+        }
+        this.lastTriedCode = undefined;
+        this.log.warn(
+          `Hive: could not start a new sign-in (${(err as Error).message}). Trying again shortly.`,
+        );
       }
       if (signedIn) {
         this.startup();
@@ -569,8 +594,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   /** Store the challenge so a restart can resume it; readable by Homebridge alone. */
   private async saveChallenge(pending: PendingChallenge): Promise<void> {
     try {
-      await fs.writeFile(this.challengeStorePath, JSON.stringify(pending), { mode: 0o600 });
-      await fs.chmod(this.challengeStorePath, 0o600);
+      await writePrivateFile(this.challengeStorePath, JSON.stringify(pending));
     } catch (err) {
       this.log.warn(`Hive: could not store the 2FA challenge: ${(err as Error).message}`);
     }
@@ -614,16 +638,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
    */
   private async saveRefreshToken(refreshToken: string): Promise<void> {
     try {
-      await fs.writeFile(
+      await writePrivateFile(
         this.tokenStorePath,
         JSON.stringify({
           refreshToken,
           username: this.cfg.username,
           device: this.auth?.device(),
         }),
-        { mode: 0o600 },
       );
-      await fs.chmod(this.tokenStorePath, 0o600);
     } catch (err) {
       this.log.warn(`Hive: could not persist refresh token: ${(err as Error).message}`);
     }
@@ -670,9 +692,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   }
 
   private async discoverDevices(): Promise<void> {
-    let state: HiveState;
+    let reported: HiveState;
     try {
-      state = await this.fetchState();
+      reported = await this.fetchState();
     } catch (err) {
       // Leaves `discovered` false so the next poll tries again — otherwise one
       // bad response at startup (a timeout, a Hive 5xx) would leave every later
@@ -683,6 +705,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       );
       return;
     }
+    const state = this.enabledOnly(reported);
 
     for (const zone of state.zones) {
       this.registerHeating(zone);
@@ -731,17 +754,25 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       );
     }
 
-    if (allProducts(state).length === 0) {
+    // An answer with nothing in it at all is far more likely to be Hive having
+    // a bad moment than an account emptied of every device — and pruning on it
+    // would delete every accessory, taking the user's rooms, scenes and
+    // automations with them. Keep them: they report No Response until Hive
+    // lists them again.
+    const hiveReportedNothing = allProducts(reported).length === 0;
+    if (hiveReportedNothing) {
       this.log.warn(
-        'Hive: no supported devices found on this account. ' +
-          'If you expected devices here, please open a GitHub issue with your ' +
-          'Homebridge log.',
+        'Hive: no supported devices found on this account. Existing accessories ' +
+          'are kept, in case this is a passing fault at Hive. If you expected ' +
+          'devices here, please open a GitHub issue with your Homebridge log.',
       );
     }
 
     // Remove stale accessories no longer present on the account.
     const liveIds = new Set(allProducts(state).map((p) => p.id));
-    const stale = this.accessories.filter((a) => !liveIds.has(a.context.hiveId));
+    const stale = hiveReportedNothing
+      ? []
+      : this.accessories.filter((a) => !liveIds.has(a.context.hiveId));
     if (stale.length) {
       this.homebridgeApi.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
       // Homebridge does not prune our own cache, so drop them here too — an
@@ -759,23 +790,45 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     // Seed initial values.
     this.applyState(state);
 
-    // Matter registration is the last thing discoverDevices() does, and
-    // bootstrap() only reaches startPolling() once it resolves — so an
-    // exception here (a matter.js conformance rejection, a device-type shape
-    // this Homebridge does not offer) must not escape, or a Matter-only problem
-    // would leave the poll timer unarmed and freeze the plain HomeKit
-    // accessories too.
-    try {
-      await this.matterPlatform?.register(state);
-    } catch (err) {
-      this.log.error(
-        `Hive: Matter registration failed (${(err as Error).message}). ` +
-          'HomeKit accessories are unaffected; please open a GitHub issue with ' +
-          'your Homebridge version.',
-      );
+    if (!hiveReportedNothing) {
+      await this.registerMatter(state);
     }
 
     this.discovered = true;
+  }
+
+  /**
+   * Register the Matter accessories, or retry whatever did not register last
+   * time; a no-op once everything has.
+   *
+   * Never throws: bootstrap() only reaches startPolling() once discovery
+   * resolves, so a Matter-only problem (a matter.js conformance rejection, a
+   * device-type shape this Homebridge does not offer) must not escape, or it
+   * would leave the poll timer unarmed and freeze the HomeKit accessories too.
+   * Some failures pass on their own — Homebridge refuses registrations while
+   * its Matter server is still starting — so every poll tries again.
+   */
+  private async registerMatter(state: HiveState): Promise<void> {
+    if (!this.matterPlatform?.needsRegistration) {
+      return;
+    }
+    try {
+      await this.matterPlatform.register(state);
+      this.matterFailureReported = false;
+    } catch (err) {
+      const message =
+        `Hive: Matter registration failed (${(err as Error).message}). ` +
+        'HomeKit accessories are unaffected; retrying on the next poll.';
+      if (this.matterFailureReported) {
+        this.log.debug(message);
+      } else {
+        this.matterFailureReported = true;
+        this.log.error(
+          `${message} If this keeps happening, please open a GitHub issue ` +
+            'with your Homebridge version.',
+        );
+      }
+    }
   }
 
   /**
@@ -884,7 +937,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   // ---- Polling -------------------------------------------------------------
 
   private startPolling(): void {
-    if (this.shuttingDown) {
+    // Already running when this is a sign-in after Hive rejected the session.
+    if (this.shuttingDown || this.pollTimer) {
       return;
     }
     this.pollTimer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
@@ -898,7 +952,9 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
    * concurrent polls that each retry auth and fight over the token.
    */
   private async pollOnce(): Promise<void> {
-    if (this.polling) {
+    // Signed out after Hive rejected the session: nothing to read with until
+    // the new sign-in completes, and the accessories already say so.
+    if (this.polling || !this.tokens) {
       return;
     }
     this.polling = true;
@@ -909,15 +965,23 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         await this.discoverDevices();
         return;
       }
-      this.applyState(await this.fetchState());
+      const reported = await this.fetchState();
+      const state = this.enabledOnly(reported);
+      this.applyState(state);
       if (this.failedPolls >= STALE_AFTER_FAILED_POLLS) {
         this.log.info('Hive: responding again; accessories are back to live state.');
       }
       this.failedPolls = 0;
+      if (allProducts(reported).length > 0) {
+        await this.registerMatter(state);
+      }
     } catch (err) {
       this.log.debug(`Hive poll error: ${(err as Error).message}`);
       if (++this.failedPolls === STALE_AFTER_FAILED_POLLS) {
-        this.markUnreachable(err as Error);
+        this.markUnreachable(
+          `Hive: no response for ${STALE_AFTER_FAILED_POLLS} polls in a row ` +
+            `(${(err as Error).message}); reporting accessories as unreachable until it recovers.`,
+        );
       }
     } finally {
       this.polling = false;
@@ -932,11 +996,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
    * revoked — the last values it sent would otherwise be served as live for as
    * long as the outage lasts. The next successful poll restores them.
    */
-  private markUnreachable(cause: Error): void {
-    this.log.warn(
-      `Hive: no response for ${STALE_AFTER_FAILED_POLLS} polls in a row ` +
-        `(${cause.message}); reporting accessories as unreachable until it recovers.`,
-    );
+  private markUnreachable(message: string): void {
+    this.log.warn(message);
     for (const handler of this.handlers.values()) {
       handler.markUnreachable();
     }
@@ -947,19 +1008,18 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
 
   /**
    * Read Hive state, refreshing the session and retrying once if the token has
-   * expired, rather than serving stale state until the next tick.
+   * expired, rather than serving stale state until the next tick. Every kind
+   * of device is included; see enabledOnly().
    */
   private async fetchState(): Promise<HiveState> {
-    let state: HiveState;
     try {
-      state = await this.api!.getState();
+      return await this.api!.getState();
     } catch (err) {
       if (!(err instanceof TokenExpiredError) || !(await this.refreshTokens())) {
         throw err;
       }
-      state = await this.api!.getState();
+      return this.api!.getState();
     }
-    return this.enabledOnly(state);
   }
 
   /**
@@ -1131,7 +1191,6 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     try {
       this.tokens = await this.auth.refreshFromToken(this.tokens.refreshToken);
       await this.saveRefreshToken(this.tokens.refreshToken);
-      this.authFailureReported = false;
       this.log.debug('Hive: tokens refreshed.');
       return true;
     } catch (err) {
@@ -1142,22 +1201,47 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
         this.log.debug(`Hive: token refresh failed, will retry: ${(err as Error).message}`);
         return false;
       }
-      const message =
-        'Hive: token refresh failed. Re-authentication needed — ' +
-        're-enter credentials and an SMS code in the config. ' +
-        `(${(err as Error).message})`;
-      // A rejected refresh token stays rejected, and polling continues in case
-      // the failure was transient — so report it once at error level and keep
-      // the rest at debug rather than filling the log every 15 seconds.
-      if (this.authFailureReported) {
-        this.log.debug(message);
-      } else {
-        this.authFailureReported = true;
-        this.log.error(message);
-      }
+      await this.signOut(err as Error);
       return false;
     }
   }
+
+  /**
+   * Hive has rejected the session outright, so it will never work again: sign
+   * in afresh, as a restart would. Without 2FA that is silent; with it, a code
+   * is texted and the user enters it as at setup — no restart needed.
+   *
+   * Until then polls are skipped and the accessories report No Response,
+   * rather than asking Cognito every poll to honour a token it has refused.
+   * The stored token goes too, so a restart meanwhile does not try it again.
+   */
+  private async signOut(cause: Error): Promise<void> {
+    if (!this.tokens) {
+      return;
+    }
+    this.tokens = undefined;
+    this.failedPolls = STALE_AFTER_FAILED_POLLS;
+    this.markUnreachable(
+      `Hive: the session was rejected (${cause.message}); signing in again. ` +
+        'If Hive texts a 2FA code, enter it in the "2FA Code" field and click Save.',
+    );
+    await fs.unlink(this.tokenStorePath).catch(() => {
+      /* already gone */
+    });
+    this.startup();
+  }
+}
+
+/**
+ * Write a file only the Homebridge user can read, replacing it in one step: a
+ * crash or power cut mid-write leaves the old file whole rather than a
+ * truncated one, which for the session would cost a new SMS sign-in.
+ */
+async function writePrivateFile(file: string, data: string): Promise<void> {
+  const temp = `${file}.tmp`;
+  await fs.writeFile(temp, data, { mode: 0o600 });
+  await fs.chmod(temp, 0o600);
+  await fs.rename(temp, file);
 }
 
 /** Every product in a state, of every kind. */

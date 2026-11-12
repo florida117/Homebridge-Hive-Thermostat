@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const settings = require('../dist/settings');
 const { HiveAuth } = require('../dist/hiveAuth');
-const { HiveApi } = require('../dist/hiveApi');
+const { HiveApi, TokenExpiredError } = require('../dist/hiveApi');
 const { HiveThermostatPlatform } = require('../dist/platform');
 const h = require('./helpers');
 
@@ -55,7 +55,7 @@ function stubHive({
 }
 
 /** Construct the platform and let Homebridge finish launching. */
-function launch(t, { stored, challenge, cached = [], config = {} } = {}) {
+function launch(t, { stored, challenge, cached = [], config = {}, matter } = {}) {
   const storagePath = h.tempStorage();
   const tokenFile = path.join(storagePath, '.hive-thermostat-tokens.json');
   const challengeFile = path.join(storagePath, '.hive-thermostat-2fa.json');
@@ -65,7 +65,7 @@ function launch(t, { stored, challenge, cached = [], config = {} } = {}) {
   if (challenge) {
     fs.writeFileSync(challengeFile, JSON.stringify(challenge));
   }
-  const homebridge = h.createHomebridge({ storagePath });
+  const homebridge = h.createHomebridge({ storagePath, matter });
   const log = h.createLog();
   const platform = new HiveThermostatPlatform(
     log,
@@ -348,7 +348,7 @@ test('a code saved in the config after the SMS is checked against that login, wi
   await h.until(() => fs.existsSync(challengeFile));
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(hive.submit.mock.callCount(), 0, 'the stale code is never submitted');
-  assert.ok(log.messages('warn').some((m) => m.includes('sent to +********1234') && m.includes('no need to restart')));
+  assert.ok(log.messages('warn').some((m) => m.includes('sent to +********1234') && m.includes('you can click Close')));
 
   saveCode(' 222 222 ');
   await h.until(discovered(homebridge));
@@ -369,6 +369,11 @@ test('the 2FA challenge is stored privately', async (t) => {
   assert.equal(stored.challenge.session, 's1');
   assert.equal(stored.username, 'me@example.com');
   assert.equal(fs.statSync(challengeFile).mode & 0o777, 0o600);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(challengeFile)).filter((f) => f.endsWith('.tmp')),
+    [],
+    'written in one step, leaving nothing behind',
+  );
 });
 
 test('a restart with the code in the config answers the stored login instead of starting another', async (t) => {
@@ -474,6 +479,123 @@ test('a 2FA code that could not be submitted is retried, not sent to a fresh log
   assert.equal(hive.login.mock.callCount(), 1);
   assert.deepEqual(submitted(hive), [['222222', 's1'], ['222222', 's1']]);
   assert.ok(log.messages('warn').some((m) => /could not submit the 2FA code/.test(m)));
+});
+
+test('a new sign-in for an expired code that could not reach Hive is tried again', async (t) => {
+  const hive = stubSmsLogin(async (_code, challenge) => {
+    if (challenge.session === 's1') {
+      throw cognitoError('NotAuthorizedException');
+    }
+    return TOKENS;
+  });
+  let logins = 0;
+  hive.login.mock.mockImplementation(async () => {
+    if (++logins === 2) {
+      throw networkError();
+    }
+    throw new HiveSmsRequired(challengeFrom(`s${logins}`));
+  });
+  const { homebridge, log, saveCode } = launch(t);
+  await h.until(() => logins === 1);
+
+  saveCode('222222');
+  await h.until(() => logins === 3);
+  assert.ok(log.messages('warn').some((m) => /could not start a new sign-in/.test(m)));
+  assert.equal(log.messages('error').length, 0);
+
+  saveCode('333333');
+  await h.until(discovered(homebridge));
+  assert.deepEqual(submitted(hive), [['222222', 's1'], ['222222', 's1'], ['333333', 's3']]);
+});
+
+test('a session Hive rejects later is replaced by signing in again, without a restart', async (t) => {
+  const hive = stubSmsLogin();
+  const { platform, homebridge, log, tokenFile, saveCode } =
+    launch(t, { stored: { refreshToken: 'stored', username: 'me@example.com' } });
+  await h.until(discovered(homebridge));
+  assert.equal(hive.login.mock.callCount(), 0);
+  const temperature = characteristic(heatingAccessory(homebridge), hap.Characteristic.CurrentTemperature);
+
+  hive.refresh.mock.mockImplementation(async () => {
+    throw cognitoError('NotAuthorizedException');
+  });
+  hive.getState.mock.mockImplementationOnce(async () => {
+    throw new TokenExpiredError();
+  });
+  await platform.pollOnce();
+
+  await h.until(() => hive.login.mock.callCount() === 1);
+  assert.ok(log.messages('warn').some((m) => m.includes('session was rejected') && m.includes('2FA Code')));
+  assert.ok(log.messages('warn').some((m) => m.includes('two-factor authentication')));
+  assert.equal(fs.existsSync(tokenFile), false, 'the refused token is not kept for a restart to try');
+  await assert.rejects(temperature.handleGetRequest(), (status) => status === COMMUNICATION_FAILURE);
+
+  const refreshes = hive.refresh.mock.callCount();
+  await platform.pollOnce();
+  assert.equal(hive.refresh.mock.callCount(), refreshes, 'a refused token is not tried every poll');
+
+  saveCode('222222');
+  await h.until(() => fs.existsSync(tokenFile));
+  await platform.pollOnce();
+  assert.equal(await temperature.handleGetRequest(), 19);
+  assert.deepEqual(submitted(hive), [['222222', 's1']]);
+  assert.equal(homebridge.registered.length, 2, 'the same accessories carry on');
+  assert.deepEqual(homebridge.unregistered, []);
+});
+
+test('an empty answer from Hive at startup keeps the accessories it already had', async (t) => {
+  stubHive({ getState: async () => ({ zones: [], hotWater: [], plugs: [], lights: [], sensors: [] }) });
+  const cached = new (h.createHomebridge().platformAccessory)(
+    'Downstairs',
+    hap.uuid.generate('hive-heating-zone-1'),
+  );
+  cached.context.hiveId = 'zone-1';
+  const { homebridge, log } = launch(t, { stored: { refreshToken: 'stored' }, cached: [cached] });
+
+  await h.until(() => log.messages('warn').some((m) => m.includes('no supported devices')));
+
+  assert.deepEqual(homebridge.unregistered, []);
+  await assert.rejects(
+    characteristic(cached, hap.Characteristic.CurrentTemperature).handleGetRequest(),
+    (status) => status === COMMUNICATION_FAILURE,
+  );
+});
+
+test('a target outside the range Hive accepts is shown at the nearest end of it', async (t) => {
+  stubHive({
+    getState: async () => ({ zones: [h.zone({ mode: 'OFF', targetTemperature: 1 })], hotWater: [h.hotWater()] }),
+  });
+  const { homebridge } = launch(t, { stored: { refreshToken: 'stored' } });
+  await h.until(discovered(homebridge));
+  const target = characteristic(heatingAccessory(homebridge), hap.Characteristic.TargetTemperature);
+  const warnings = [];
+  target.on('characteristic-warning', (warning) => warnings.push(warning));
+
+  assert.equal(target.value, settings.HIVE_MIN_TEMP);
+  assert.equal(await target.handleGetRequest(), settings.HIVE_MIN_TEMP);
+  assert.deepEqual(warnings, [], 'HAP is not left to clamp it, with a warning each time');
+});
+
+test('a Matter registration Homebridge refuses at startup is retried on the next poll', async (t) => {
+  stubHive();
+  let refusing = true;
+  const fake = h.createMatter({ throws: () => refusing });
+  const { platform, homebridge, log } = launch(t, {
+    stored: { refreshToken: 'stored' },
+    config: { enableMatter: true },
+    matter: fake.matter,
+  });
+  await h.until(discovered(homebridge));
+  await h.until(() => log.messages('warn').some((m) => m.includes('could not register Matter accessory')));
+  assert.equal(fake.endpoints.size, 0);
+
+  refusing = false;
+  await platform.pollOnce();
+  await h.settle();
+
+  assert.deepEqual([...fake.endpoints.keys()].sort(), ['hive-matter-heating-zone-1', 'hive-matter-hotwater-hw-1']);
+  assert.equal(fake.state('hive-matter-heating-zone-1').localTemperature, 1900);
+  assert.equal(log.messages('error').length, 0);
 });
 
 test('without credentials, cached accessories still report No Response', async (t) => {

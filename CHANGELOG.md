@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.3] - 2026-11-12
+
+### Changed
+- **The 2FA setup steps now mention Homebridge UI's "Restart Required"
+  prompt.** Homebridge UI asks for a restart after every save, which
+  contradicted the plugin's "no restart needed" (#6). The log, settings and
+  README now say you can click **Close**, and that restarting does no harm
+  either: the plugin carries on with the same code.
+
+### Fixed
+- **A session Hive rejected left the plugin stuck until a restart.** The log
+  asked for a new 2FA code, but none was sent until Homebridge restarted, and
+  every poll asked Hive to accept the rejected session again. The plugin now
+  signs in again by itself. Without 2FA this needs nothing from you; with it,
+  enter the new code and click Save, as at setup.
+- **Matter accessories could stop updating until a restart** if Homebridge
+  refused their registration, which it does while its Matter server is still
+  starting. Each refused accessory is now retried on the next poll, and the
+  others are registered meanwhile.
+- **An empty answer from Hive at startup removed every accessory**, taking
+  their rooms, scenes and automations with them. Accessories are now kept
+  when Hive reports no devices at all; they show No Response until Hive lists
+  them again.
+- **Waiting for a 2FA code stopped for good** if a new sign-in after an
+  expired code could not reach Hive. It is now tried again.
+- **The stored session could be corrupted by a power cut mid-write**, costing
+  a new 2FA sign-in. It is now replaced in one step.
+- **A heating target outside 5–32°C**, which Hive may report for a zone that
+  is off, is shown at the nearest end of that range. Matter would otherwise
+  refuse the zone's whole update, current temperature included.
+
 ## [1.3.2] - 2026-11-12
 
 ### Fixed

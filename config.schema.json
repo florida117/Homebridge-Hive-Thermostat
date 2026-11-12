@@ -2,7 +2,7 @@
   "pluginAlias": "HiveThermostat",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/florida117/Homebridge-Hive-Thermostat/main/branding/hive_logo.png\" width=\"100\"></p>\n\nExposes Hive heating zones, radiator valves and hot water — plus Hive plugs, lights and motion and door/window sensors — to HomeKit via the Hive cloud API.\n\n**First-time setup with 2FA:** enter your username and password and restart. If your account uses SMS two-factor authentication, check the Homebridge log — you'll be prompted to enter the SMS code in the **2FA Code** field below. Enter it and click Save — no second restart is needed. After that the field can be left blank.",
+  "headerDisplay": "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/florida117/Homebridge-Hive-Thermostat/main/branding/hive_logo.png\" width=\"100\"></p>\n\nExposes Hive heating zones, radiator valves and hot water — plus Hive plugs, lights and motion and door/window sensors — to HomeKit via the Hive cloud API.\n\n**First-time setup with 2FA:** enter your username and password and restart. If your account uses SMS two-factor authentication, check the Homebridge log — you'll be prompted to enter the SMS code in the **2FA Code** field below. Enter it and click Save. Homebridge UI will then say a restart is required: there is no need, so you can click **Close** (restarting does no harm either). After that the field can be left blank.",
   "footerDisplay": "For help and issues see the project's GitHub repository.",
   "schema": {
     "type": "object",
@@ -33,7 +33,7 @@
       "smsCode": {
         "title": "2FA Code (first-time setup only)",
         "type": "string",
-        "description": "Only needed during initial pairing if your account has SMS two-factor authentication. Enter the code from the text message and click Save — no restart needed. Once the log says \"2FA accepted\", clear this field."
+        "description": "Only needed during initial pairing if your account has SMS two-factor authentication. Enter the code from the text message and click Save. When Homebridge UI then asks you to restart, you can click Close: the plugin picks the code up within a few seconds. Once the log says \"2FA accepted\", clear this field."
       },
       "pollInterval": {
         "title": "Poll Interval (seconds)",
