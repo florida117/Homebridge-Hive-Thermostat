@@ -32,6 +32,9 @@ All notable changes to this project are documented here.
 - **A heating target outside 5–32°C**, which Hive may report for a zone that
   is off, is shown at the nearest end of that range. Matter would otherwise
   refuse the zone's whole update, current temperature included.
+- **Tuneable and colour lights logged an "illegal value" warning for Color
+  Temperature at every startup.** The value is now moved into the bulb's
+  range before the range is applied.
 
 ## [1.3.2] - 2026-11-12
 

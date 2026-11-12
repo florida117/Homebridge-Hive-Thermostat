@@ -948,3 +948,20 @@ test('battery devices report that they cannot charge', async (t) => {
     );
   }
 });
+
+test('narrowing a light\'s colour temperature range raises no HAP warnings', async (t) => {
+  const warn = mock.method(console, 'warn', () => {});
+  const { homebridge } = await launchDevices(t, {
+    // No reading, so the value the characteristic starts with stays put.
+    lights: [light({ colourTemperature: undefined })],
+  });
+  const bulb = byUuid(homebridge, 'hive-light-light-1').getService(hap.Service.Lightbulb);
+  const colourTemperature = bulb.getCharacteristic(hap.Characteristic.ColorTemperature);
+
+  assert.deepEqual(
+    warn.mock.calls.map((c) => String(c.arguments[0])).filter((m) => m.includes('illegal value')),
+    [],
+  );
+  assert.deepEqual([colourTemperature.props.minValue, colourTemperature.props.maxValue], [153, 370]);
+  assert.equal(colourTemperature.value, 153);
+});
