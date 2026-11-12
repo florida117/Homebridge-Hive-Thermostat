@@ -47,12 +47,21 @@ import {
   HiveApi,
   HiveHeatingType,
   HiveHeatingZone,
+  HiveLight,
+  HiveLightChange,
+  HiveLightType,
   HiveMode,
+  HivePlug,
+  HiveSensor,
+  HiveSensorType,
   HiveState,
   TokenExpiredError,
 } from './hiveApi';
 import { HiveHeatingAccessory } from './heatingAccessory';
 import { HiveHotWaterAccessory } from './hotWaterAccessory';
+import { HivePlugAccessory } from './plugAccessory';
+import { HiveLightAccessory } from './lightAccessory';
+import { HiveSensorAccessory } from './sensorAccessory';
 import { HiveMatterPlatform } from './matterPlatform';
 
 interface HiveConfig extends PlatformConfig {
@@ -62,7 +71,18 @@ interface HiveConfig extends PlatformConfig {
   pollInterval?: number;
   hotWaterDurationMinutes?: number;
   enableMatter?: boolean;
+  /** Each defaults to on; false leaves that kind of device out entirely. */
+  enablePlugs?: boolean;
+  enableLights?: boolean;
+  enableSensors?: boolean;
 }
+
+type Handler =
+  | HiveHeatingAccessory
+  | HiveHotWaterAccessory
+  | HivePlugAccessory
+  | HiveLightAccessory
+  | HiveSensorAccessory;
 
 /** What `.hive-thermostat-tokens.json` holds. */
 interface StoredTokens {
@@ -125,10 +145,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private readonly matterPlatform?: HiveMatterPlatform;
 
   /** Handlers keyed by hive product id, so polling can push updates. */
-  private readonly handlers = new Map<
-    string,
-    HiveHeatingAccessory | HiveHotWaterAccessory
-  >();
+  private readonly handlers = new Map<string, Handler>();
 
   constructor(
     public readonly log: Logger,
@@ -159,6 +176,8 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
           setHotWaterBoost: (id, minutes) => this.setHotWaterBoost(id, minutes),
           cancelHotWaterBoost: (id, returnTo) =>
             this.cancelHotWaterBoost(id, returnTo),
+          setPlug: (id, on) => this.setPlug(id, on),
+          setLight: (light, change) => this.setLight(light, change),
           pollSoon: (delayMs) => this.pollSoon(delayMs),
         },
         this.hotWaterBoostMinutes,
@@ -432,6 +451,18 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
           id,
           new HiveHotWaterAccessory(this, accessory, id, this.hotWaterBoostMinutes),
         );
+      } else if (accessory.UUID === this.plugUuid(id)) {
+        this.handlers.set(id, new HivePlugAccessory(this, accessory, id));
+      } else if (accessory.UUID === this.lightUuid(id) && isLightType(accessory.context.hiveType)) {
+        this.handlers.set(
+          id,
+          new HiveLightAccessory(this, accessory, id, accessory.context.hiveType),
+        );
+      } else if (accessory.UUID === this.sensorUuid(id) && isSensorType(accessory.context.hiveType)) {
+        this.handlers.set(
+          id,
+          new HiveSensorAccessory(this, accessory, id, accessory.context.hiveType),
+        );
       }
     }
   }
@@ -471,19 +502,43 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       );
     }
 
-    if (state.zones.length === 0 && state.hotWater.length === 0) {
+    for (const plug of state.plugs ?? []) {
+      this.registerPlug(plug);
+      this.log.info(
+        `Discovered plug "${plug.name}" (${plug.on ? 'on' : 'off'}` +
+          `${plug.online ? '' : ', OFFLINE'}).`,
+      );
+    }
+    for (const light of state.lights ?? []) {
+      this.registerLight(light);
+      this.log.info(
+        `Discovered light "${light.name}" (${light.type}, ` +
+          `${light.on ? `on at ${light.brightness}%` : 'off'}${light.online ? '' : ', OFFLINE'}).`,
+      );
+    }
+    for (const sensor of state.sensors ?? []) {
+      this.registerSensor(sensor);
+      const motion = sensor.type === 'motionsensor';
+      this.log.info(
+        `Discovered ${motion ? 'motion sensor' : 'window/door sensor'} "${sensor.name}" (` +
+          (motion
+            ? sensor.triggered ? 'motion' : 'no motion'
+            : sensor.triggered ? 'open' : 'closed') +
+          `${sensor.battery !== undefined ? `, battery ${sensor.battery}%` : ''}` +
+          `${sensor.online ? '' : ', OFFLINE'}).`,
+      );
+    }
+
+    if (allProducts(state).length === 0) {
       this.log.warn(
-        'Hive: no heating zones, radiator valves or hot water found on this account. ' +
+        'Hive: no supported devices found on this account. ' +
           'If you expected devices here, please open a GitHub issue with your ' +
           'Homebridge log.',
       );
     }
 
     // Remove stale accessories no longer present on the account.
-    const liveIds = new Set([
-      ...state.zones.map((z) => z.id),
-      ...state.hotWater.map((h) => h.id),
-    ]);
+    const liveIds = new Set(allProducts(state).map((p) => p.id));
     const stale = this.accessories.filter((a) => !liveIds.has(a.context.hiveId));
     if (stale.length) {
       this.homebridgeApi.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
@@ -577,6 +632,45 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     return accessory;
   }
 
+  private registerPlug(plug: HivePlug): void {
+    const accessory = this.platformAccessory(this.plugUuid(plug.id), plug.id, plug.name, {
+      hiveType: plug.type,
+    });
+    if (!(this.handlers.get(plug.id) instanceof HivePlugAccessory)) {
+      this.handlers.set(plug.id, new HivePlugAccessory(this, accessory, plug.id));
+    }
+  }
+
+  private registerLight(light: HiveLight): void {
+    const accessory = this.platformAccessory(this.lightUuid(light.id), light.id, light.name, {
+      hiveType: light.type,
+    });
+    if (!(this.handlers.get(light.id) instanceof HiveLightAccessory)) {
+      this.handlers.set(light.id, new HiveLightAccessory(this, accessory, light.id, light.type));
+    }
+  }
+
+  private registerSensor(sensor: HiveSensor): void {
+    const accessory = this.platformAccessory(this.sensorUuid(sensor.id), sensor.id, sensor.name, {
+      hiveType: sensor.type,
+    });
+    if (!(this.handlers.get(sensor.id) instanceof HiveSensorAccessory)) {
+      this.handlers.set(sensor.id, new HiveSensorAccessory(this, accessory, sensor.id, sensor.type));
+    }
+  }
+
+  private plugUuid(id: string): string {
+    return this.homebridgeApi.hap.uuid.generate(`hive-plug-${id}`);
+  }
+
+  private lightUuid(id: string): string {
+    return this.homebridgeApi.hap.uuid.generate(`hive-light-${id}`);
+  }
+
+  private sensorUuid(id: string): string {
+    return this.homebridgeApi.hap.uuid.generate(`hive-sensor-${id}`);
+  }
+
   private heatingUuid(id: string): string {
     return this.homebridgeApi.hap.uuid.generate(`hive-heating-${id}`);
   }
@@ -654,14 +748,30 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
    * expired, rather than serving stale state until the next tick.
    */
   private async fetchState(): Promise<HiveState> {
+    let state: HiveState;
     try {
-      return await this.api!.getState();
+      state = await this.api!.getState();
     } catch (err) {
       if (!(err instanceof TokenExpiredError) || !(await this.refreshTokens())) {
         throw err;
       }
-      return this.api!.getState();
+      state = await this.api!.getState();
     }
+    return this.enabledOnly(state);
+  }
+
+  /**
+   * Drop the kinds of device the config turns off. Everything downstream then
+   * treats them as gone, so turning a kind off also removes its accessories.
+   */
+  private enabledOnly(state: HiveState): HiveState {
+    return {
+      zones: state.zones,
+      hotWater: state.hotWater,
+      plugs: this.cfg.enablePlugs === false ? [] : state.plugs ?? [],
+      lights: this.cfg.enableLights === false ? [] : state.lights ?? [],
+      sensors: this.cfg.enableSensors === false ? [] : state.sensors ?? [],
+    };
   }
 
   /**
@@ -710,6 +820,14 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
     return this.command((api) => api.cancelHotWaterBoost(id, returnTo));
   }
 
+  setPlug(id: string, on: boolean): Promise<void> {
+    return this.command((api) => api.setPlug(id, on));
+  }
+
+  setLight(light: Pick<HiveLight, 'id' | 'type'>, change: HiveLightChange): Promise<void> {
+    return this.command((api) => api.setLight(light, change));
+  }
+
   /**
    * Schedule a one-off poll shortly after a control command, so HomeKit
    * reflects the confirmed device state without waiting for the next regular
@@ -736,7 +854,7 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
   private applyState(state: HiveState): void {
     // A product Hive no longer reports has nothing live to show: report it
     // unreachable, rather than leave whatever it last had on display.
-    const reported = new Set([...state.zones, ...state.hotWater].map((p) => p.id));
+    const reported = new Set(allProducts(state).map((p) => p.id));
     for (const [id, handler] of this.handlers) {
       if (!reported.has(id)) {
         handler.markUnreachable();
@@ -758,6 +876,33 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       }
       this.matterPlatform?.updateHotWater(hw).catch((err) =>
         this.log.debug(`Hive Matter hot water update failed: ${(err as Error).message}`),
+      );
+    }
+    for (const plug of state.plugs ?? []) {
+      const h = this.handlers.get(plug.id);
+      if (h instanceof HivePlugAccessory) {
+        h.update(plug);
+      }
+      this.matterPlatform?.updatePlug(plug).catch((err) =>
+        this.log.debug(`Hive Matter plug update failed: ${(err as Error).message}`),
+      );
+    }
+    for (const light of state.lights ?? []) {
+      const h = this.handlers.get(light.id);
+      if (h instanceof HiveLightAccessory) {
+        h.update(light);
+      }
+      this.matterPlatform?.updateLight(light).catch((err) =>
+        this.log.debug(`Hive Matter light update failed: ${(err as Error).message}`),
+      );
+    }
+    for (const sensor of state.sensors ?? []) {
+      const h = this.handlers.get(sensor.id);
+      if (h instanceof HiveSensorAccessory) {
+        h.update(sensor);
+      }
+      this.matterPlatform?.updateSensor(sensor).catch((err) =>
+        this.log.debug(`Hive Matter sensor update failed: ${(err as Error).message}`),
       );
     }
   }
@@ -811,6 +956,25 @@ export class HiveThermostatPlatform implements DynamicPlatformPlugin {
       return false;
     }
   }
+}
+
+/** Every product in a state, of every kind. */
+function allProducts(state: HiveState): { id: string }[] {
+  return [
+    ...state.zones,
+    ...state.hotWater,
+    ...(state.plugs ?? []),
+    ...(state.lights ?? []),
+    ...(state.sensors ?? []),
+  ];
+}
+
+function isLightType(value: unknown): value is HiveLightType {
+  return value === 'warmwhitelight' || value === 'tuneablelight' || value === 'colourtuneablelight';
+}
+
+function isSensorType(value: unknown): value is HiveSensorType {
+  return value === 'motionsensor' || value === 'contactsensor';
 }
 
 /** A stored device, if the file holds a complete one. */

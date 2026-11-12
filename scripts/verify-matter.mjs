@@ -41,6 +41,8 @@ const { version: homebridgeVersion } = JSON.parse(
 console.log(`Homebridge ${homebridgeVersion}`);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// How long the plugin gathers a hue/saturation pair (src/matterPlatform.ts).
+const COLOUR_GATHER_MS = 100;
 let failures = 0;
 function check(label, ok, detail = '') {
   console.log(`${ok ? '✔' : '✖'} ${label}${detail ? ` — ${detail}` : ''}`);
@@ -67,9 +69,43 @@ const hotWater = (overrides = {}) => ({
 const valve = (overrides = {}) => zone({
   id: 'room1', type: 'trvcontrol', name: 'Bedroom', battery: 80, ...overrides,
 });
-const state = { zones: [zone(), valve()], hotWater: [hotWater()] };
+// Plugs, lights and sensors, shaped as HiveApi normalises them.
+const plug = (overrides = {}) => ({
+  id: 'plug1', type: 'activeplug', name: 'Lamp Plug', online: true, on: false, ...overrides,
+});
+const RANGE = { min: 2700, max: 6535 };
+const lights = {
+  warm: { id: 'light1', type: 'warmwhitelight', name: 'Hall', online: true, on: false, brightness: 100 },
+  tuneable: {
+    id: 'light2', type: 'tuneablelight', name: 'Kitchen', online: true, on: false, brightness: 100,
+    colourTemperature: 2700, colourTemperatureRange: RANGE,
+  },
+  colour: {
+    id: 'light3', type: 'colourtuneablelight', name: 'Lounge', online: true, on: false, brightness: 100,
+    colourTemperature: 3300, colourTemperatureRange: RANGE, colourMode: 'WHITE', hue: 45, saturation: 65,
+  },
+};
+const sensors = {
+  motion: { id: 'sensor1', type: 'motionsensor', name: 'Landing', online: true, triggered: false, battery: 80 },
+  contact: { id: 'sensor2', type: 'contactsensor', name: 'Back Door', online: true, triggered: false, battery: 80 },
+};
+const state = {
+  zones: [zone(), valve()],
+  hotWater: [hotWater()],
+  plugs: [plug()],
+  lights: Object.values(lights),
+  sensors: Object.values(sensors),
+};
 const HEATING = hap.uuid.generate('hive-matter-heating-zone1');
 const VALVE = hap.uuid.generate('hive-matter-heating-room1');
+const PLUG = hap.uuid.generate('hive-matter-plug-plug1');
+const LIGHT = Object.fromEntries(
+  Object.entries(lights).map(([k, l]) => [k, hap.uuid.generate(`hive-matter-light-${l.id}`)]),
+);
+const SENSOR = Object.fromEntries(
+  Object.entries(sensors).map(([k, x]) => [k, hap.uuid.generate(`hive-matter-sensor-${x.id}`)]),
+);
+const ALL = [HEATING, VALVE, PLUG, ...Object.values(LIGHT), ...Object.values(SENSOR)];
 const HOT_WATER = hap.uuid.generate('hive-matter-hotwater-hw1');
 
 const homebridgeErrors = [];
@@ -124,6 +160,8 @@ async function boot() {
     setHeatingTarget: async (z, temp) => sent.push(`${node(z)}target ${temp}`),
     setHotWaterBoost: async () => sent.push('boost'),
     cancelHotWaterBoost: async (_id, mode) => sent.push(`cancel to ${mode}`),
+    setPlug: async (id, on) => sent.push(`${id} ${on ? 'on' : 'off'}`),
+    setLight: async (light, change) => sent.push(`${light.id} ${JSON.stringify(change)}`),
     pollSoon: () => {},
   };
   const log = {
@@ -147,9 +185,16 @@ async function boot() {
     await platform.updateHeating(z);
   }
   await platform.updateHotWater(state.hotWater[0]);
+  await platform.updatePlug(state.plugs[0]);
+  for (const l of state.lights) {
+    await platform.updateLight(l);
+  }
+  for (const x of state.sensors) {
+    await platform.updateSensor(x);
+  }
   await platform.register(state);
   for (let waited = 0; waited < 20_000; waited += 100) {
-    if ([HEATING, VALVE, HOT_WATER].every((uuid) => server.accessories.get(uuid)?.endpoint)) {
+    if ([...ALL, HOT_WATER].every((uuid) => server.accessories.get(uuid)?.endpoint)) {
       break;
     }
     await sleep(100);
@@ -241,12 +286,91 @@ try {
   sent = await drain(first);
   check('a radiator valve poll write is not echoed to Hive', sent.length === 0, JSON.stringify(sent));
 
+  // ---- Plugs, lights and sensors ---------------------------------------------
+  const pushAll = async (overrides = {}) => {
+    await first.platform.updatePlug(plug(overrides.plug));
+    for (const [k, l] of Object.entries(lights)) {
+      await first.platform.updateLight({ ...l, ...overrides[k] });
+    }
+    for (const [k, x] of Object.entries(sensors)) {
+      await first.platform.updateSensor({ ...x, ...overrides[k] });
+    }
+    return drain(first);
+  };
+  for (const [name, uuid] of [['plug', PLUG], ...Object.entries(LIGHT), ...Object.entries(SENSOR)]) {
+    check(`${name} comes online`, !!first.endpoint(uuid));
+  }
+  sent = await pushAll();
+  check('plug, light and sensor poll writes are not sent back to Hive', sent.length === 0, JSON.stringify(sent));
+
+  const act = (uuid, fn) => first.endpoint(uuid)?.act(fn);
+  await act(PLUG, (agent) => agent.onOff.on());
+  await act(PLUG, (agent) => agent.onOff.toggle());
+  sent = await drain(first);
+  check('plug commands reach Hive once each', sent.join() === 'plug1 on,plug1 off', JSON.stringify(sent));
+
+  const options = { transitionTime: 0, optionsMask: {}, optionsOverride: {} };
+  await act(LIGHT.warm, (agent) => agent.onOff.on());
+  await act(LIGHT.warm, (agent) => agent.levelControl.moveToLevelWithOnOff({ level: 127, ...options }));
+  sent = await drain(first);
+  check('dimmable light on and level reach Hive',
+    sent.join() === 'light1 {"on":true},light1 {"brightness":50}', JSON.stringify(sent));
+
+  await pushAll({ warm: { on: true, brightness: 50 } });
+  await act(LIGHT.warm, (agent) => agent.levelControl.moveToLevelWithOnOff({ level: 0, ...options }));
+  sent = await drain(first);
+  check('level 0 with on/off turns the light off', sent.join() === 'light1 {"on":false}', JSON.stringify(sent));
+
+  await act(LIGHT.tuneable, (agent) => agent.onOff.on());
+  await act(LIGHT.tuneable, (agent) =>
+    agent.colorControl.moveToColorTemperature({ colorTemperatureMireds: 250, ...options }));
+  sent = await drain(first);
+  check('tuneable light colour temperature reaches Hive in kelvin',
+    sent.join() === 'light2 {"on":true},light2 {"colourTemperature":4000}', JSON.stringify(sent));
+
+  await act(LIGHT.colour, (agent) => agent.onOff.on());
+  await pushAll({ warm: { on: true, brightness: 50 }, tuneable: { on: true }, colour: { on: true } });
+  await act(LIGHT.colour, (agent) =>
+    agent.colorControl.moveToHueAndSaturation({ hue: 127, saturation: 254, ...options }));
+  await sleep(COLOUR_GATHER_MS + 100);
+  sent = await drain(first);
+  check('a colour reaches Hive as one write', sent.join() === 'light3 {"hue":180,"saturation":100}',
+    JSON.stringify(sent));
+
+  await act(LIGHT.colour, (agent) =>
+    agent.colorControl.moveToColor({ colorX: Math.round(0.64 * 65536), colorY: Math.round(0.33 * 65536), ...options }));
+  await sleep(COLOUR_GATHER_MS + 100);
+  sent = await drain(first);
+  check('an xy colour reaches Hive as one hue/saturation write',
+    sent.length === 1 && /^light3 \{"hue":(0|35[89]),"saturation":100\}$/.test(sent[0]), JSON.stringify(sent));
+
+  await act(LIGHT.colour, (agent) =>
+    agent.colorControl.moveToColorTemperature({ colorTemperatureMireds: 370, ...options }));
+  sent = await drain(first);
+  check('colour light colour temperature reaches Hive',
+    sent.join() === 'light3 {"colourTemperature":2703}', JSON.stringify(sent));
+
+  sent = await pushAll({
+    warm: { on: true, brightness: 50 }, tuneable: { on: true, colourTemperature: 4000 },
+    colour: { on: true, colourMode: 'COLOUR', hue: 180, saturation: 100 },
+    motion: { triggered: true }, contact: { triggered: true },
+  });
+  check('a poll after commands is not sent back to Hive', sent.length === 0, JSON.stringify(sent));
+  const colourState = first.endpoint(LIGHT.colour)?.state.colorControl;
+  check('a polled colour reaches the endpoint',
+    colourState?.currentHue === 127 && colourState?.currentSaturation === 254 && colourState?.colorMode === 0,
+    JSON.stringify({ hue: colourState?.currentHue, sat: colourState?.currentSaturation, mode: colourState?.colorMode }));
+  check('motion reaches the occupancy sensor',
+    first.endpoint(SENSOR.motion)?.state.occupancySensing.occupancy.occupied === true);
+  check('an open door reaches the contact sensor',
+    first.endpoint(SENSOR.contact)?.state.booleanState.stateValue === false);
+
   await poll({ targetTemperature: 18, online: false });
   check('an offline zone is unreachable', thermostat.state.bridgedDeviceBasicInformation.reachable === false);
   await poll({ targetTemperature: 18 });
   check('a zone back online is reachable', thermostat.state.bridgedDeviceBasicInformation.reachable === true);
 
-  const numbers = new Map([HEATING, VALVE, HOT_WATER].map((uuid) => [uuid, first.endpoint(uuid)?.number]));
+  const numbers = new Map([...ALL, HOT_WATER].map((uuid) => [uuid, first.endpoint(uuid)?.number]));
   await sleep(2500); // let Homebridge persist its accessory cache
   await first.server.stop();
 
@@ -263,14 +387,25 @@ try {
     console.log('  (this Homebridge restores nothing from its cache)');
   }
   check('every endpoint is live after the restart',
-    !!second.endpoint(HEATING) && !!second.endpoint(VALVE) && !!second.endpoint(HOT_WATER));
-  for (const [uuid, name] of [[HEATING, 'thermostat'], [VALVE, 'radiator valve'], [HOT_WATER, 'hot water']]) {
+    [...ALL, HOT_WATER].every((uuid) => !!second.endpoint(uuid)),
+    [...ALL, HOT_WATER].filter((uuid) => !second.endpoint(uuid)).join(', '));
+  for (const [uuid, name] of [
+    [HEATING, 'thermostat'], [VALVE, 'radiator valve'], [HOT_WATER, 'hot water'], [PLUG, 'plug'],
+    ...Object.entries(LIGHT).map(([k, u]) => [u, `${k} light`]),
+    ...Object.entries(SENSOR).map(([k, u]) => [u, `${k} sensor`]),
+  ]) {
     check(`the ${name} keeps its endpoint number`, second.endpoint(uuid)?.number === numbers.get(uuid),
       `${numbers.get(uuid)} -> ${second.endpoint(uuid)?.number}`);
   }
   await second.endpoint(HOT_WATER)?.act((agent) => agent.onOff.on());
   sent = await drain(second);
   check('hot water commands work after the restart', sent.join() === 'boost', JSON.stringify(sent));
+  await second.endpoint(HOT_WATER)?.act((agent) => agent.onOff.toggle());
+  sent = await drain(second);
+  check('a hot water toggle reaches Hive once', sent.join() === 'cancel to SCHEDULE', JSON.stringify(sent));
+  await second.endpoint(LIGHT.colour)?.act((agent) => agent.onOff.off());
+  sent = await drain(second);
+  check('light commands work after the restart', sent.join() === 'light3 {"on":false}', JSON.stringify(sent));
   await second.server.stop();
 } catch (err) {
   check('run completed', false, err.stack);

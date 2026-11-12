@@ -191,8 +191,13 @@ test('cancelling a boost returns hot water to its resting mode', async () => {
   await platform.updateHotWater(h.hotWater({ boosting: true, mode: 'MANUAL' }));
   await h.settle();
 
-  const { toggle } = fake.endpoints.get(HOT_WATER).handlers.onOff;
+  // A toggle on a boosting outlet reaches the plugin as off(): matter.js
+  // carries toggles out through on()/off(), so the toggle handler itself does
+  // nothing (checked on real endpoints by scripts/verify-matter.mjs).
+  const { off, toggle } = fake.endpoints.get(HOT_WATER).handlers.onOff;
   await toggle();
+  assert.deepEqual(sent, []);
+  await off();
 
   assert.deepEqual(sent, [['cancelHotWaterBoost', 'hw-1', 'MANUAL']]);
 });
@@ -312,4 +317,15 @@ test('a radiator valve room is a Matter thermostat whose commands carry its prod
     ['setHeatingMode', 'trv-room-1', 'OFF'],
   ]);
   assert.deepEqual(commanded.map((z) => z.type), ['trvcontrol', 'trvcontrol']);
+});
+
+// ---- Light colour conversion -----------------------------------------------
+
+test('xy colours convert to the hue and saturation Hive takes', () => {
+  const { hueSaturationFromXy } = matterModule;
+  // sRGB primaries, and D65 white.
+  assert.deepEqual(hueSaturationFromXy(0.64, 0.33), { hue: 0, saturation: 100 });
+  assert.deepEqual(hueSaturationFromXy(0.3, 0.6), { hue: 120, saturation: 100 });
+  assert.deepEqual(hueSaturationFromXy(0.15, 0.06), { hue: 240, saturation: 100 });
+  assert.equal(hueSaturationFromXy(0.3127, 0.329).saturation, 0);
 });

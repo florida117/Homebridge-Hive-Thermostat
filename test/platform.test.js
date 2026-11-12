@@ -440,3 +440,145 @@ test('a cached radiator valve is reused as one, keeping its Battery service and 
   await characteristic(cached, hap.Characteristic.TargetTemperature).handleSetRequest(21);
   assert.deepEqual(writes, ['/1.0/nodes/trvcontrol/trv-room-1']);
 });
+
+// ---- Plugs, lights and sensors ----------------------------------------------
+
+function plug(overrides = {}) {
+  return { id: 'plug-1', type: 'activeplug', name: 'Lamp', online: true, on: false, ...overrides };
+}
+
+function light(overrides = {}) {
+  return {
+    id: 'light-1', type: 'colourtuneablelight', name: 'Lounge', online: true, on: true, brightness: 80,
+    colourTemperature: 2700, colourTemperatureRange: { min: 2700, max: 6535 },
+    colourMode: 'WHITE', hue: 45, saturation: 65, ...overrides,
+  };
+}
+
+function sensor(overrides = {}) {
+  return { id: 'sensor-1', type: 'contactsensor', name: 'Back Door', online: true, triggered: false, battery: 80, ...overrides };
+}
+
+function byUuid(homebridge, name) {
+  return homebridge.registered.find((a) => a.UUID === hap.uuid.generate(name));
+}
+
+/** Launch with plugs, lights and sensors on the account; records Hive writes. */
+async function launchDevices(t, state = {}, config = {}) {
+  const hive = stubHive({
+    getState: async () => ({
+      zones: [], hotWater: [], plugs: [plug()], lights: [light()], sensors: [sensor()], ...state,
+    }),
+  });
+  const writes = [];
+  globalThis.fetch = async (url, init) => {
+    writes.push([new URL(url).pathname, JSON.parse(init.body)]);
+    return new Response('{}', { status: 200 });
+  };
+  const launched = launch(t, { stored: { refreshToken: 'stored' }, config });
+  await h.until(() => launched.log.messages('info').some((m) => m.startsWith('Discovered')));
+  await h.settle();
+  return { ...launched, hive, writes };
+}
+
+test('a plug is an Outlet whose switch writes its own node', async (t) => {
+  const { homebridge, writes } = await launchDevices(t);
+  const outlet = byUuid(homebridge, 'hive-plug-plug-1').getService(hap.Service.Outlet);
+
+  assert.equal(await outlet.getCharacteristic(hap.Characteristic.On).handleGetRequest(), false);
+  await outlet.getCharacteristic(hap.Characteristic.On).handleSetRequest(true);
+
+  assert.deepEqual(writes, [['/1.0/nodes/activeplug/plug-1', { status: 'ON' }]]);
+});
+
+test('a light dims in Hive\'s 5% steps and converts colour temperature to kelvin', async (t) => {
+  const { homebridge, writes } = await launchDevices(t);
+  const bulb = byUuid(homebridge, 'hive-light-light-1').getService(hap.Service.Lightbulb);
+  const set = (type, value) => bulb.getCharacteristic(type).handleSetRequest(value);
+
+  await set(hap.Characteristic.Brightness, 37);
+  await set(hap.Characteristic.Brightness, 1);
+  await set(hap.Characteristic.Brightness, 0);
+  await set(hap.Characteristic.ColorTemperature, 250);
+
+  assert.deepEqual(writes.map(([, body]) => body), [
+    { status: 'ON', brightness: 35 },
+    { status: 'ON', brightness: 5 },
+    // Zero sends nothing: the On write that comes with it turns the light off.
+    { colourMode: 'WHITE', colourTemperature: 4000 },
+  ]);
+  const range = bulb.getCharacteristic(hap.Characteristic.ColorTemperature).props;
+  assert.deepEqual([range.minValue, range.maxValue], [153, 370]);
+});
+
+test('a light\'s hue and saturation reach Hive as one write', async (t) => {
+  const { homebridge, writes } = await launchDevices(t);
+  const bulb = byUuid(homebridge, 'hive-light-light-1').getService(hap.Service.Lightbulb);
+
+  await Promise.all([
+    bulb.getCharacteristic(hap.Characteristic.Hue).handleSetRequest(200),
+    bulb.getCharacteristic(hap.Characteristic.Saturation).handleSetRequest(90),
+  ]);
+
+  assert.deepEqual(writes, [[
+    '/1.0/nodes/colourtuneablelight/light-1',
+    { colourMode: 'COLOUR', hue: '200', saturation: '90', value: '100' },
+  ]]);
+});
+
+test('a dimmable light has no colour controls, and a colour light has all of them', async (t) => {
+  const { homebridge } = await launchDevices(t, {
+    lights: [light({ id: 'warm', type: 'warmwhitelight', colourTemperature: undefined }), light()],
+  });
+  const has = (name, type) =>
+    byUuid(homebridge, name).getService(hap.Service.Lightbulb).testCharacteristic(type);
+
+  assert.equal(has('hive-light-warm', hap.Characteristic.ColorTemperature), false);
+  assert.equal(has('hive-light-warm', hap.Characteristic.Hue), false);
+  assert.equal(has('hive-light-light-1', hap.Characteristic.ColorTemperature), true);
+  assert.equal(has('hive-light-light-1', hap.Characteristic.Hue), true);
+});
+
+test('sensors report contact and motion, with a battery', async (t) => {
+  const { homebridge } = await launchDevices(t, {
+    sensors: [sensor({ triggered: true }), sensor({ id: 'motion-1', type: 'motionsensor', triggered: true, battery: 10 })],
+  });
+  const contact = byUuid(homebridge, 'hive-sensor-sensor-1');
+  const motion = byUuid(homebridge, 'hive-sensor-motion-1');
+
+  assert.equal(
+    await contact.getService(hap.Service.ContactSensor)
+      .getCharacteristic(hap.Characteristic.ContactSensorState).handleGetRequest(),
+    hap.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED,
+  );
+  assert.equal(
+    await motion.getService(hap.Service.MotionSensor)
+      .getCharacteristic(hap.Characteristic.MotionDetected).handleGetRequest(),
+    true,
+  );
+  assert.equal(
+    await motion.getService(hap.Service.Battery)
+      .getCharacteristic(hap.Characteristic.StatusLowBattery).handleGetRequest(),
+    hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW,
+  );
+});
+
+test('a kind of device turned off in the config is left out, and removed if cached', async (t) => {
+  const cached = new (h.createHomebridge().platformAccessory)('Lounge', hap.uuid.generate('hive-light-light-1'));
+  Object.assign(cached.context, { hiveId: 'light-1', hiveType: 'colourtuneablelight' });
+  stubHive({
+    getState: async () => ({ zones: [], hotWater: [], plugs: [plug()], lights: [light()], sensors: [sensor()] }),
+  });
+  const { homebridge, log } = launch(t, {
+    stored: { refreshToken: 'stored' },
+    cached: [cached],
+    config: { enableLights: false },
+  });
+  await h.until(() => log.messages('info').some((m) => m.startsWith('Discovered plug')));
+  await h.settle();
+
+  assert.ok(!log.messages('info').some((m) => m.startsWith('Discovered light')));
+  assert.deepEqual(homebridge.unregistered, [cached]);
+  assert.ok(byUuid(homebridge, 'hive-plug-plug-1'));
+  assert.ok(byUuid(homebridge, 'hive-sensor-sensor-1'));
+});

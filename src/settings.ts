@@ -50,7 +50,10 @@ export const HIVE_MAX_TEMP = 32;
 export const HIVE_TEMP_STEP = 0.5;
 
 /**
- * Battery level (percent) at or below which a radiator valve reports low
- * battery to HomeKit.
+ * Battery level (percent) at or below which a battery-powered device (radiator
+ * valve, sensor) reports low battery to HomeKit.
  */
-export const TRV_LOW_BATTERY_PERCENT = 20;
+export const LOW_BATTERY_PERCENT = 20;
+
+/** Hive light brightness moves in 5% steps, never below 5% while on. */
+export const LIGHT_BRIGHTNESS_STEP = 5;

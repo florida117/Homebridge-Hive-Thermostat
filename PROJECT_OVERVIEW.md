@@ -1,6 +1,6 @@
 # Project overview
 
-This folder contains `homebridge-hive-thermostat`, a TypeScript Homebridge dynamic platform plugin. Its purpose is to expose Hive heating zones and Hive hot water controls to Apple HomeKit through Homebridge, using Hive's cloud API rather than talking directly to the Hive hub on the local network.
+This folder contains `homebridge-hive-thermostat`, a TypeScript Homebridge dynamic platform plugin. Its purpose is to expose Hive heating zones, radiator valves, hot water controls, plugs, lights and sensors to Apple HomeKit through Homebridge, using Hive's cloud API rather than talking directly to the Hive hub on the local network.
 
 The plugin is designed to work around Hive's own HomeKit bridge reliability problems by making Homebridge the HomeKit-facing bridge. Hive remains the source of truth for device state, schedules, modes, and commands.
 
@@ -10,6 +10,10 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 - Hive hot water products become HomeKit `Switch` accessories.
 - On Homebridge v2 with Matter enabled, Hive heating products also become Matter `Thermostat` accessories.
 - On Homebridge v2 with Matter enabled, Hive hot water products also become Matter On/Off Outlet accessories for manual boost control.
+- Hive Active Plugs become HomeKit `Outlet` accessories (Matter On/Off Outlet).
+- Hive bulbs become HomeKit `Lightbulb` accessories with brightness, plus colour temperature (tuneable and colour bulbs) and hue/saturation (colour bulbs). Over Matter they are Dimmable, Color Temperature or Extended Color Lights.
+- Hive motion and door/window sensors become HomeKit `MotionSensor` / `ContactSensor` accessories with a battery service (Matter Occupancy / Contact Sensor).
+- Plugs, lights and sensors follow pyhiveapi's captured API shapes and are untested on real hardware. Each kind can be turned off with `enablePlugs` / `enableLights` / `enableSensors`.
 - Offline Hive devices are surfaced as HomeKit communication failures, so Home shows `No Response` instead of stale values — as is everything, once Hive itself stops answering. Matter accessories are marked unreachable in the same cases.
 - HomeKit changes are sent back to Hive through the Beekeeper API, then confirmed by a short follow-up poll.
 
@@ -26,6 +30,11 @@ The plugin is designed to work around Hive's own HomeKit bridge reliability prob
 | `src/hiveApi.ts` | Thin client for Hive's Beekeeper API. Fetches and normalizes state, and posts command changes. |
 | `src/heatingAccessory.ts` | Maps each Hive heating zone to a HomeKit thermostat service. |
 | `src/hotWaterAccessory.ts` | Maps each Hive hot water product to a HomeKit switch service for timed boost control. |
+| `src/plugAccessory.ts` | Maps each Hive Active Plug to a HomeKit outlet. |
+| `src/lightAccessory.ts` | Maps each Hive bulb to a HomeKit lightbulb; gathers hue and saturation into one Hive write. |
+| `src/lightUnits.ts` | Kelvin ↔ mireds and Hive's 5% brightness steps. |
+| `src/sensorAccessory.ts` | Maps each Hive motion or contact sensor to a HomeKit sensor with battery. |
+| `src/accessoryBase.ts` | Shared HAP accessory plumbing: reachability and the lazily added battery service. |
 | `src/matterPlatform.ts` | Registers and updates optional Homebridge v2 Matter accessories. |
 | `src/timeout.ts` | Deadlines for every network call: `fetchWithTimeout()` for the plugin's own requests, `withTimeout()` for Cognito's. |
 | `test/` | `node:test` suite, run against the compiled plugin in `dist/`. |
@@ -187,7 +196,7 @@ Hot water is represented as a Matter On/Off Outlet:
 
 - Matter `on`: start a Hive hot water boost for `hotWaterDurationMinutes`.
 - Matter `off`: cancel the boost and return to the previous Hive mode.
-- Matter `toggle`: switches between those two actions based on the last known Hive boost state.
+- Matter `toggle`: matter.js carries a toggle out by calling `on`/`off`, so the toggle handler itself does nothing.
 
 Matter does not expose Hive schedule editing. Hive schedule mode is represented as Matter `Auto`.
 
@@ -212,6 +221,9 @@ For each discovered Hive product, it creates a stable HomeKit UUID:
 
 - Heating: `hive-heating-{id}`
 - Hot water: `hive-hotwater-{id}`
+- Plug: `hive-plug-{id}`
+- Light: `hive-light-{id}`
+- Sensor: `hive-sensor-{id}`
 
 If a Hive product has disappeared, the platform unregisters the stale Homebridge accessory. If a Hive product has been renamed, the cached accessory display name is updated.
 
@@ -263,6 +275,7 @@ Available config fields:
 | `pollInterval` | Poll interval in seconds. Minimum 15. |
 | `hotWaterDurationMinutes` | Duration of a manual hot water boost. |
 | `enableMatter` | Whether to register Matter accessories when Homebridge Matter is enabled. Defaults to `true`. |
+| `enablePlugs` / `enableLights` / `enableSensors` | Whether to expose that kind of device. Default `true`; turning one off removes its accessories. |
 
 ## Build and development
 

@@ -2,9 +2,15 @@
  * HiveApi — thin client over Hive's beekeeper API.
  *
  * Responsibilities:
- *   - GET /nodes/all  → parse heating zones, radiator valves and hot water into
- *     a normalised shape
- *   - POST /nodes/{type}/{id} → write mode / target temperature / boost
+ *   - GET /nodes/all  → parse heating zones, radiator valves, hot water, smart
+ *     plugs, lights and sensors into a normalised shape
+ *   - POST /nodes/{type}/{id} → write mode / target temperature / boost, and
+ *     plug and light state
+ *
+ * Hive publishes no API documentation. Payload shapes follow pyhiveapi (the
+ * library behind Home Assistant's Hive integration) and its captured account
+ * data. Heating, radiator valves and hot water have been checked against a
+ * real account; plugs, lights and sensors have not.
  *
  * Auth is via the Cognito IdToken in the `authorization` header. Token refresh
  * is handled by the caller (the platform), which passes a getter so a freshly
@@ -75,9 +81,96 @@ export interface HiveHotWater {
   boosting: boolean;
 }
 
+/** A Hive Active Plug. */
+export interface HivePlug {
+  id: string;
+  type: 'activeplug';
+  name: string;
+  online: boolean;
+  on: boolean;
+  /** Whether something plugged in is drawing power, where Hive reports it. */
+  inUse?: boolean;
+}
+
+export type HiveLightType = 'warmwhitelight' | 'tuneablelight' | 'colourtuneablelight';
+
+/**
+ * A Hive Active Light. Every light dims; a tuneable light also has a colour
+ * temperature, and a colour light has both that and a hue/saturation colour.
+ */
+export interface HiveLight {
+  id: string;
+  type: HiveLightType;
+  name: string;
+  online: boolean;
+  on: boolean;
+  /** 0–100. */
+  brightness: number;
+  /** Tuneable and colour lights: the white colour temperature, in kelvin. */
+  colourTemperature?: number;
+  /** Tuneable and colour lights: the range the bulb supports, in kelvin. */
+  colourTemperatureRange?: { min: number; max: number };
+  /** Colour lights: which of white or colour the bulb is showing. */
+  colourMode?: 'WHITE' | 'COLOUR';
+  /** Colour lights: 0–360. */
+  hue?: number;
+  /** Colour lights: 0–100. */
+  saturation?: number;
+}
+
+/** A change to a light; only the fields given are written. */
+export type HiveLightChange =
+  | { on: boolean }
+  | { brightness: number }
+  | { colourTemperature: number }
+  | { hue: number; saturation: number };
+
+export type HiveSensorType = 'motionsensor' | 'contactsensor';
+
+/** A Hive motion or window/door sensor. */
+export interface HiveSensor {
+  id: string;
+  type: HiveSensorType;
+  name: string;
+  online: boolean;
+  /** Motion detected, or the door/window open. */
+  triggered: boolean;
+  /** Battery level in percent, where Hive reports one. */
+  battery?: number;
+}
+
 export interface HiveState {
   zones: HiveHeatingZone[];
   hotWater: HiveHotWater[];
+  /** Always filled by HiveApi; optional so callers can omit empty lists. */
+  plugs?: HivePlug[];
+  lights?: HiveLight[];
+  sensors?: HiveSensor[];
+}
+
+/** Hive's documented-by-example colour temperature range, in kelvin. */
+const DEFAULT_COLOUR_TEMPERATURE_RANGE = { min: 2700, max: 6535 };
+
+const LIGHT_TYPES: readonly string[] = ['warmwhitelight', 'tuneablelight', 'colourtuneablelight'];
+const SENSOR_TYPES: readonly string[] = ['motionsensor', 'contactsensor'];
+
+/** A number Hive sent, or undefined for anything else (null included). */
+function finite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** A number sent as a number or numeric string; undefined otherwise. */
+function numeric(value: unknown): number | undefined {
+  if (typeof value === 'string' && value.trim() !== '') {
+    return finite(Number(value));
+  }
+  return finite(value);
+}
+
+/** A percentage reading, or undefined if it is missing or out of range. */
+function percent(value: unknown): number | undefined {
+  const n = finite(value);
+  return n !== undefined && n >= 0 && n <= 100 ? n : undefined;
 }
 
 export class HiveApi {
@@ -95,7 +188,7 @@ export class HiveApi {
     };
   }
 
-  /** Fetch and normalise all heating + hot water products. */
+  /** Fetch and normalise every product this plugin supports. */
   async getState(): Promise<HiveState> {
     const res = await fetchWithTimeout(HIVE_URLS.nodesAll, {
       headers: this.headers(),
@@ -127,8 +220,19 @@ export class HiveApi {
       return true;
     };
 
+    // Plugs, lights and sensors are their own device: the product and device
+    // share an id, while the product's `parent` is the hub. pyhiveapi reads
+    // their online status the same way.
+    const ownOnline = (p: any): boolean => {
+      const device = deviceById.get(p.id);
+      return device ? device.props?.online !== false : p.props?.online !== false;
+    };
+
     const zones: HiveHeatingZone[] = [];
     const hotWater: HiveHotWater[] = [];
+    const plugs: HivePlug[] = [];
+    const lights: HiveLight[] = [];
+    const sensors: HiveSensor[] = [];
 
     for (const p of products) {
       if (p.type === 'heating') {
@@ -137,10 +241,84 @@ export class HiveApi {
         zones.push(this.parseRadiatorValve(p, deviceById));
       } else if (p.type === 'hotwater') {
         hotWater.push(this.parseHotWater(p, resolveOnline(p)));
+      } else if (p.type === 'activeplug') {
+        plugs.push(this.parsePlug(p, ownOnline(p)));
+      } else if (LIGHT_TYPES.includes(p.type)) {
+        lights.push(this.parseLight(p, ownOnline(p)));
+      } else if (SENSOR_TYPES.includes(p.type)) {
+        sensors.push(this.parseSensor(p, ownOnline(p), deviceById.get(p.id)));
       }
     }
 
-    return { zones, hotWater };
+    return { zones, hotWater, plugs, lights, sensors };
+  }
+
+  private parsePlug(p: any, online: boolean): HivePlug {
+    const props = p.props ?? {};
+    return {
+      id: p.id,
+      type: 'activeplug',
+      name: p.state?.name ?? 'Plug',
+      online,
+      on: p.state?.status === 'ON',
+      ...(typeof props.inUse === 'boolean' ? { inUse: props.inUse } : {}),
+    };
+  }
+
+  private parseLight(p: any, online: boolean): HiveLight {
+    const state = p.state ?? {};
+    const props = p.props ?? {};
+    const type = p.type as HiveLightType;
+    const light: HiveLight = {
+      id: p.id,
+      type,
+      name: state.name ?? 'Light',
+      online,
+      on: state.status === 'ON',
+      brightness: percent(state.brightness) ?? 100,
+    };
+    if (type !== 'warmwhitelight') {
+      const min = finite(props.colourTemperature?.min);
+      const max = finite(props.colourTemperature?.max);
+      light.colourTemperatureRange =
+        min && max && min < max ? { min, max } : { ...DEFAULT_COLOUR_TEMPERATURE_RANGE };
+      const kelvin = finite(state.colourTemperature);
+      if (kelvin && kelvin > 0) {
+        light.colourTemperature = kelvin;
+      }
+    }
+    if (type === 'colourtuneablelight') {
+      light.colourMode = state.colourMode === 'COLOUR' ? 'COLOUR' : 'WHITE';
+      // pyhiveapi writes these as strings, so accept either form back.
+      const hue = numeric(state.hue);
+      const saturation = percent(numeric(state.saturation));
+      if (hue !== undefined && hue >= 0 && hue <= 360) {
+        light.hue = hue;
+      }
+      if (saturation !== undefined) {
+        light.saturation = saturation;
+      }
+    }
+    return light;
+  }
+
+  /**
+   * A motion sensor reports `props.motion.status` (a boolean); a contact
+   * sensor reports `props.status`, "OPEN" or "CLOSED". Battery is on the
+   * product's props, and on the device as for every battery-powered device.
+   */
+  private parseSensor(p: any, online: boolean, device: any): HiveSensor {
+    const props = p.props ?? {};
+    const type = p.type as HiveSensorType;
+    const battery = percent(props.battery) ?? percent(device?.props?.battery);
+    return {
+      id: p.id,
+      type,
+      name: p.state?.name ?? (type === 'motionsensor' ? 'Motion Sensor' : 'Contact Sensor'),
+      online,
+      triggered: type === 'motionsensor' ? props.motion?.status === true : props.status === 'OPEN',
+      ...(battery !== undefined ? { battery } : {}),
+    };
   }
 
   private parseHeating(p: any, online: boolean): HiveHeatingZone {
@@ -231,7 +409,7 @@ export class HiveApi {
 
   /** POST a state change to a node. */
   private async setNodeState(
-    type: HiveHeatingType | 'hotwater',
+    type: HiveHeatingType | 'hotwater' | 'activeplug' | HiveLightType,
     id: string,
     payload: Record<string, string | number>,
   ): Promise<void> {
@@ -316,6 +494,46 @@ export class HiveApi {
   cancelHotWaterBoost(id: string, returnTo: HiveMode = 'SCHEDULE'): Promise<void> {
     return this.setNodeState('hotwater', id, { mode: returnTo });
   }
+
+  setPlug(id: string, on: boolean): Promise<void> {
+    return this.setNodeState('activeplug', id, { status: on ? 'ON' : 'OFF' });
+  }
+
+  /** Write one change to a light; see lightPayload(). */
+  setLight(light: Pick<HiveLight, 'id' | 'type'>, change: HiveLightChange): Promise<void> {
+    return this.setNodeState(light.type, light.id, lightPayload(light, change));
+  }
+}
+
+/**
+ * The Hive write for a light change, as pyhiveapi sends it.
+ *
+ * - Brightness also switches the light on.
+ * - A colour temperature on a colour bulb also selects white mode.
+ * - A colour is sent as hue/saturation/value strings with value 100, which is
+ *   what pyhiveapi (and so Home Assistant) sends; brightness stays separate.
+ */
+export function lightPayload(
+  light: Pick<HiveLight, 'type'>,
+  change: HiveLightChange,
+): Record<string, string | number> {
+  if ('on' in change) {
+    return { status: change.on ? 'ON' : 'OFF' };
+  }
+  if ('brightness' in change) {
+    return { status: 'ON', brightness: change.brightness };
+  }
+  if ('colourTemperature' in change) {
+    return light.type === 'colourtuneablelight'
+      ? { colourMode: 'WHITE', colourTemperature: change.colourTemperature }
+      : { colourTemperature: change.colourTemperature };
+  }
+  return {
+    colourMode: 'COLOUR',
+    hue: String(Math.round(change.hue)),
+    saturation: String(Math.round(change.saturation)),
+    value: '100',
+  };
 }
 
 /** Raised on a 401 so the platform knows to refresh tokens and retry. */
