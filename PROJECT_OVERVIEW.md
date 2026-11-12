@@ -85,6 +85,14 @@ would otherwise be honoured silently after the username changed. (Files from
 1.0.9 and earlier have no username and are trusted.) The file is written with
 mode `0600` where possible.
 
+The Cognito device is stored alongside it. Hive's user pool tracks devices: a
+login registers one, the refresh token is bound to it, and Cognito rejects the
+token ("Invalid Refresh Token") unless the device key is sent with it. The
+Cognito SDK keeps the device only in memory, so before 1.2.1 every restart
+fell back to a full password login (and an SMS code, where Hive asks for one).
+`HiveAuth` gives the SDK its own storage so the device can be read out after a
+login and put back before a refresh.
+
 Failures are classified by `isTransientAuthError()`. Anything without a Cognito
 `…Exception` code — a network failure, a timeout, the SSO page not loading — and
 Cognito's own service errors are retried; a verdict on the account (a wrong

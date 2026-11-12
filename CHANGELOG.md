@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.1] - 2026-11-12
+
+### Fixed
+- **Every restart signed in to Hive again instead of reusing the stored
+  session**, logging "stored refresh token rejected… (Invalid Refresh Token.)".
+  Hive ties the session to a device it registers at sign-in, and the plugin
+  did not keep that device across restarts. On accounts where Hive asks for
+  an SMS code at sign-in, that could mean a new code after every restart. The
+  device is now stored with the session. The first restart after upgrading
+  still signs in once; restarts after that reuse the session.
+
 ## [1.2.0] - 2026-11-11
 
 ### Added

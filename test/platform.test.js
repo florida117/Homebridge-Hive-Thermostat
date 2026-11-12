@@ -162,8 +162,42 @@ test('a session stored before usernames were recorded is still used', async (t) 
 
   await h.until(discovered(homebridge));
 
-  assert.deepEqual(hive.refresh.mock.calls[0].arguments, ['legacy']);
+  assert.equal(hive.refresh.mock.calls[0].arguments[0], 'legacy');
   assert.equal(hive.login.mock.callCount(), 0);
+});
+
+// ---- Cognito device ---------------------------------------------------------
+
+const DEVICE = { username: 'cognito-user', key: 'eu-west-1_dev', groupKey: 'group', password: 'device-secret' };
+
+test('the Cognito device is stored with the refresh token and handed back on restart', async (t) => {
+  const hive = stubHive();
+  mock.method(HiveAuth.prototype, 'device', () => DEVICE);
+  const { homebridge, tokenFile } = launch(t, {
+    stored: { refreshToken: 'stored', username: 'me@example.com', device: DEVICE },
+  });
+
+  await h.until(discovered(homebridge));
+
+  assert.deepEqual(hive.refresh.mock.calls[0].arguments, ['stored', DEVICE]);
+  assert.equal(hive.login.mock.callCount(), 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(tokenFile, 'utf8')), {
+    refreshToken: 'refresh-2',
+    username: 'me@example.com',
+    device: DEVICE,
+  });
+  assert.equal((fs.statSync(tokenFile).mode & 0o777).toString(8), '600');
+});
+
+test('an incomplete stored device is ignored rather than sent', async (t) => {
+  const hive = stubHive();
+  const { homebridge } = launch(t, {
+    stored: { refreshToken: 'stored', device: { ...DEVICE, password: undefined } },
+  });
+
+  await h.until(discovered(homebridge));
+
+  assert.deepEqual(hive.refresh.mock.calls[0].arguments, ['stored', undefined]);
 });
 
 // ---- Accessory state --------------------------------------------------------
